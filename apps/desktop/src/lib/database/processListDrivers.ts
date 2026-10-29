@@ -1,5 +1,7 @@
 import type { ConnectionConfig, DatabaseType, QueryResult } from "@/types/database";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import type { DiagnosticEngine } from "./sessionDiagnostics";
+import { buildXuguKillTransactionSql, mapXuguTransactionRows, XUGU_OWN_SESSION_SQL, XUGU_TRANSACTION_LIST_SQL, xuguTransactionKey } from "./xuguProcessList";
 import { buildCancelQuerySql as buildMysqlCancelQuerySql, buildTerminateSessionSql as buildMysqlTerminateSessionSql, mapProcessRows as mapMysqlProcessRows, PROCESS_LIST_SQL as MYSQL_PROCESS_LIST_SQL, supportsProcessList as supportsMysqlProcessList } from "./mysqlProcessList";
 import {
   buildKingbaseCancelQuerySql,
@@ -30,15 +32,36 @@ import {
   PG_PROCESS_LIST_LEGACY_SQL,
   PG_PROCESS_LIST_SQL,
 } from "./postgresProcessList";
+import {
+  buildOceanbaseKillConnectionBlock,
+  canTerminateOceanbaseSession,
+  buildOceanbaseLockDetailsSql,
+  buildOceanbaseSessionListSql,
+  buildOracleKillSessionBlock,
+  buildOracleLockDetailsSql,
+  buildOracleOwnSessionSql,
+  buildOracleSessionListSql,
+  canTerminateOracleSession,
+  mapOceanbaseSessions,
+  oceanbaseSessionRowKey,
+  mapOracleSessions,
+  oracleSessionRowKey,
+  oracleTargetIsSelf,
+  ORACLE_SESSION_DRIVER_COLUMNS,
+  OCEANBASE_SESSION_DRIVER_COLUMNS,
+  ORACLE_SESSION_VERSION_SQL,
+  OCEANBASE_OWN_SESSION_SQL,
+  type OracleSessionTarget,
+} from "./oracleSessionManagement";
 
 /**
- * Engine-agnostic process-list model. Each supported engine contributes a driver
- * describing how to list sessions, identify the caller's own session, render the
- * columns, and kill a session. The panel component stays entirely generic.
+ * Engine-agnostic operations model. Each supported engine contributes a driver
+ * describing how to list sessions or transactions, identify the caller's own
+ * session, render columns, and perform its explicitly named action.
  */
 
-/** A displayable session row. `id` is the value passed to the driver's kill SQL. */
-export type ProcessRow = { id: number } & Record<string, string | number | null>;
+/** A displayable row. `id` is the session/process id; transaction drivers use a separate composite target. */
+export type ProcessRow = { id: number | string } & Record<string, string | number | null>;
 
 export interface ProcessColumn {
   /** Key into the mapped row. */
@@ -54,9 +77,26 @@ export interface ProcessColumn {
 }
 
 export interface ProcessListDriver {
+  diagnosticEngine?: DiagnosticEngine;
+  /** Xugu displays active transactions rather than a full session list. */
+  mode?: "transaction";
+  /** Execution database for a system-wide administrative view. */
+  database?: string;
+  /** Probe a verified engine version before choosing version-dependent SQL. */
+  versionSql?: string;
+  listSqlForVersion?(major: number): string;
+  ownSessionSqlForVersion?(major: number): string;
+  /** Keep session-manager reads and writes off the editor's client transaction. */
+  useClientSession?: boolean;
+  /** Prevent a manager-wide termination from inheriting schema-scoped confirmation. */
+  productionGuardScope?: "connection";
+  /** Some session identities are strings or composite and must be matched by the driver. */
+  ownSessionMatches?(row: ProcessRow, ownSessionRow: unknown[] | null): boolean;
+  /** Stable identity for selections and post-action readback. */
+  rowKey?(row: ProcessRow): string;
   /** Whether the panel offers multi-selection and batch query cancellation. */
   supportsBatchCancel?: boolean;
-  /** SQL that lists current sessions, one row each. */
+  /** SQL that lists sessions or, for transaction mode, active transactions. */
   listSql: string;
   /** Compatibility query used when the primary list SQL references newer columns. */
   fallbackListSql?: string;
@@ -77,7 +117,9 @@ export interface ProcessListDriver {
   /** Map a raw list result into typed rows. */
   mapRows(result: QueryResult | null | undefined): ProcessRow[];
   /** Build the validated statement that cancels the selected session's running query. */
-  buildCancelQuerySql(id: number): string;
+  buildCancelQuerySql?(id: number): string;
+  /** Xugu-only action: end the selected transaction without disconnecting its session. */
+  buildKillTransactionSql?(row: ProcessRow): string;
   /** Build the compatibility statement used when the primary cancellation function is unavailable. */
   buildFallbackCancelQuerySql?(id: number): string;
   /** Restrict cancellation fallback attempts to known compatibility failures. */
@@ -91,6 +133,15 @@ export interface ProcessListDriver {
    * only offer query cancellation, because they cannot close a session over the wire.
    */
   buildTerminateSessionSql?(id: number): string;
+  /** Build a safe action from the full selected-row snapshot. */
+  buildTerminateSessionSqlForRow?(row: ProcessRow, versionMajor?: number): string;
+  /** Disable unsafe/unsupported per-row termination targets before confirmation. */
+  canTerminateSessionRow?(row: ProcessRow): boolean;
+  terminateRowUnavailableReason?(row: ProcessRow): string | undefined;
+  /** Build a lock/holder detail query for the selected row. */
+  buildLockDetailsSql?(row: ProcessRow, versionMajor?: number): string;
+  /** These drivers expose only per-row management, not multi-selection. */
+  supportsBatchTerminate?: boolean;
   /** Build the compatibility statement used when the primary terminate function is unavailable. */
   buildFallbackTerminateSessionSql?(id: number): string;
   /** Restrict terminate fallback attempts to known compatibility failures. */
@@ -188,16 +239,86 @@ const KINGBASE_DRIVER: ProcessListDriver = {
   fallbackTerminateSessionResultError: kingbasePgTerminateSessionResultError,
 };
 
+const XUGU_COLUMNS: ProcessColumn[] = [
+  { key: "nodeId", labelKey: "processList.transactionNode", mono: true, numeric: true },
+  { key: "transactionId", labelKey: "processList.transactionId", mono: true },
+  { key: "id", labelKey: "processList.transactionSession", mono: true, numeric: true },
+  { key: "user", labelKey: "processList.colUser" },
+  { key: "db", labelKey: "processList.colDb" },
+  { key: "host", labelKey: "processList.colClient" },
+  { key: "startTime", labelKey: "processList.transactionStart" },
+];
+
+const XUGU_DRIVER: ProcessListDriver = {
+  mode: "transaction",
+  database: "SYSTEM",
+  listSql: XUGU_TRANSACTION_LIST_SQL,
+  ownSessionSql: XUGU_OWN_SESSION_SQL,
+  columns: XUGU_COLUMNS,
+  defaultSortKey: "startTime",
+  maxRows: 5000,
+  mapRows: (result) => mapXuguTransactionRows(result) as unknown as ProcessRow[],
+  rowKey: (row) => xuguTransactionKey(row as unknown as ReturnType<typeof mapXuguTransactionRows>[number]),
+  buildKillTransactionSql: (row) => buildXuguKillTransactionSql(row as unknown as ReturnType<typeof mapXuguTransactionRows>[number]),
+};
+
+const ORACLE_DRIVER: ProcessListDriver = {
+  diagnosticEngine: "oracle",
+  versionSql: ORACLE_SESSION_VERSION_SQL,
+  listSql: buildOracleSessionListSql(false),
+  listSqlForVersion: (major) => buildOracleSessionListSql(major < 12),
+  ownSessionSql: buildOracleOwnSessionSql(false),
+  ownSessionSqlForVersion: (major) => buildOracleOwnSessionSql(major < 12),
+  useClientSession: true,
+  productionGuardScope: "connection",
+  ownSessionMatches: oracleTargetIsSelf,
+  rowKey: oracleSessionRowKey,
+  columns: ORACLE_SESSION_DRIVER_COLUMNS,
+  defaultSortKey: "id",
+  maxRows: 5001,
+  mapRows: mapOracleSessions,
+  buildTerminateSessionSqlForRow: (row, major) => buildOracleKillSessionBlock(row as OracleSessionTarget, (major ?? 12) < 12),
+  canTerminateSessionRow: canTerminateOracleSession,
+  terminateRowUnavailableReason: (row) => (canTerminateOracleSession(row) ? undefined : "processList.oracleIdentityUnavailable"),
+  buildLockDetailsSql: (row, major) => buildOracleLockDetailsSql(row as OracleSessionTarget, (major ?? 12) < 12),
+  supportsBatchTerminate: false,
+};
+
+const OCEANBASE_ORACLE_DRIVER: ProcessListDriver = {
+  diagnosticEngine: "oceanbase-oracle",
+  listSql: buildOceanbaseSessionListSql(),
+  ownSessionSql: OCEANBASE_OWN_SESSION_SQL,
+  useClientSession: true,
+  productionGuardScope: "connection",
+  ownSessionMatches: (row, own) => !!own && String(row.id) === String(own[0] ?? "") && String(row.user) === String(own[1] ?? "") && String(row.tenant) === String(own[2] ?? ""),
+  rowKey: oceanbaseSessionRowKey,
+  columns: OCEANBASE_SESSION_DRIVER_COLUMNS,
+  defaultSortKey: "time",
+  maxRows: 5001,
+  mapRows: mapOceanbaseSessions,
+  buildTerminateSessionSqlForRow: buildOceanbaseKillConnectionBlock,
+  canTerminateSessionRow: canTerminateOceanbaseSession,
+  terminateRowUnavailableReason: (row) => {
+    if (row.proxySessionId !== null && row.proxySessionId !== undefined && String(row.proxySessionId) !== "") return "processList.oracleProxyUnsupported";
+    return canTerminateOceanbaseSession(row) ? undefined : "processList.oracleIdentityUnavailable";
+  },
+  buildLockDetailsSql: buildOceanbaseLockDetailsSql,
+  supportsBatchTerminate: false,
+};
+
 /** Resolve the process-list driver for a connection, or null if unsupported. */
 export function resolveProcessListDriver(dbType: DatabaseType | undefined): ProcessListDriver | null {
   if (supportsMysqlProcessList(dbType)) return MYSQL_DRIVER;
   if (dbType === "postgres") return POSTGRES_DRIVER;
   if (dbType === "opengauss") return OPENGAUSS_DRIVER;
   if (dbType === "kingbase") return KINGBASE_DRIVER;
+  if (dbType === "xugu") return XUGU_DRIVER;
+  if (dbType === "oracle") return ORACLE_DRIVER;
+  if (dbType === "oceanbase-oracle") return OCEANBASE_ORACLE_DRIVER;
   return null;
 }
 
-/** Whether any process-list viewer (MySQL or Postgres family) covers this engine. */
+/** Whether the shared operations panel covers this engine. */
 export function supportsProcessList(dbType: DatabaseType | undefined): boolean {
   return resolveProcessListDriver(dbType) !== null;
 }
@@ -221,6 +342,9 @@ export function resolveProcessListDriverForConnection(connection: ConnectionConf
   }
   const dbType = effectiveDatabaseTypeForConnection(connection);
   if (dbType === "gaussdb" && connection.driver_profile?.toLowerCase() === "opengauss") return OPENGAUSS_DRIVER;
+  // Xugu's SYS_* transaction views and DBMS_DBA.KILL_TRANS are queried through
+  // SYSTEM. A DBA grant in a business database does not make that login SYSDBA.
+  if (dbType === "xugu" && connection.username?.trim().toUpperCase() !== "SYSDBA") return null;
   return resolveProcessListDriver(dbType);
 }
 

@@ -1,4 +1,5 @@
 mod auth;
+mod credentials;
 mod demo;
 mod error;
 mod routes;
@@ -9,6 +10,7 @@ mod web_mcp;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use argon2::password_hash::rand_core::OsRng;
@@ -39,6 +41,51 @@ use web_mcp::WebMcpRuntime;
 
 const XLSX_CONTENT_TYPE: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 const DATA_GRID_EXTRACTOR_BODY_LIMIT_BYTES: usize = 96 * 1024 * 1024;
+const NON_WINDOWS_HELP_TEXT: &str = r#"Usage: dbx-web [OPTION]
+
+Start the DBX Web browser service.
+
+Options:
+  -h, --help, /help  Show this help message and exit.
+
+Environment variables:
+  DBX_PORT              Listen port (default: 4224)
+  DBX_DATA_DIR          Data directory (default: ~/.dbx-web)
+  DBX_PUBLIC_BASE_PATH  URL path prefix (default: /)
+  DBX_PASSWORD          Set the Web login password
+  DBX_DISABLE_PASSWORD  Set to 1 to disable login protection
+  DBX_STATIC_DIR        Serve frontend assets from this directory
+  RUST_LOG              Configure backend log filtering
+  RUST_BACKTRACE        Set to 1 to include Rust backtraces
+
+Examples:
+  DBX_PORT=8080 dbx-web
+  RUST_LOG=dbx_web=debug,tower_http=info dbx-web
+  RUST_BACKTRACE=1 RUST_LOG=dbx_web=debug dbx-web
+"#;
+const WINDOWS_HELP_TEXT: &str = r#"Usage: dbx-web [OPTION]
+
+Start the DBX Web browser service.
+
+Options:
+  -h, --help, /help  Show this help message and exit.
+
+Environment variables:
+  DBX_PORT              Listen port (default: 4224)
+  DBX_DATA_DIR          Data directory (default: %HOME%\.dbx-web; .\.dbx-web if HOME is unset)
+  DBX_PUBLIC_BASE_PATH  URL path prefix (default: /)
+  DBX_PASSWORD          Set the Web login password
+  DBX_DISABLE_PASSWORD  Set to 1 to disable login protection
+  DBX_STATIC_DIR        Serve frontend assets from this directory
+  RUST_LOG              Configure backend log filtering
+  RUST_BACKTRACE        Set to 1 to include Rust backtraces
+
+Examples:
+  set "DBX_PORT=8080" && dbx-web.exe
+  set "RUST_LOG=dbx_web=debug,tower_http=info" && dbx-web.exe
+  set "RUST_BACKTRACE=1" && set "RUST_LOG=dbx_web=debug" && dbx-web.exe
+"#;
+const HELP_TEXT: &str = if cfg!(windows) { WINDOWS_HELP_TEXT } else { NON_WINDOWS_HELP_TEXT };
 
 #[derive(OpenApi)]
 #[openapi(
@@ -57,6 +104,29 @@ mod data_grid_extractor_openapi_tests {
     use super::*;
 
     #[test]
+    fn help_flags_are_detected_without_starting_the_server() {
+        for flag in ["-h", "--help", "/help"] {
+            assert!(help_requested(&[flag.to_string()]));
+        }
+        assert!(help_requested(&["extra".to_string(), "--help".to_string()]));
+        assert!(!help_requested(&["--helpful".to_string()]));
+    }
+
+    #[test]
+    fn native_help_matches_the_target_shell() {
+        assert!(WINDOWS_HELP_TEXT.contains(r".\.dbx-web if HOME is unset"));
+        assert!(WINDOWS_HELP_TEXT.contains(r#"set "DBX_PORT=8080" && dbx-web.exe"#));
+        assert!(!WINDOWS_HELP_TEXT.contains("DBX_PORT=8080 dbx-web\n"));
+        if cfg!(windows) {
+            assert!(HELP_TEXT.contains(r#"set "DBX_PORT=8080" && dbx-web.exe"#));
+            assert!(!HELP_TEXT.contains("DBX_PORT=8080 dbx-web\n"));
+        } else {
+            assert!(HELP_TEXT.contains("DBX_PORT=8080 dbx-web\n"));
+            assert!(!HELP_TEXT.contains("dbx-web.exe"));
+        }
+    }
+
+    #[test]
     fn extractor_openapi_contains_the_versioned_request_and_error_responses() {
         let document = serde_json::to_value(ApiDoc::openapi()).expect("serialize extractor OpenAPI document");
         let operation = &document["paths"]["/api/query/extract-data-grid-selection"]["post"];
@@ -73,6 +143,10 @@ mod data_grid_extractor_openapi_tests {
 fn web_compression_predicate() -> impl Predicate {
     // XLSX exports are already compressed ZIP archives, so gzip would only add CPU overhead.
     DefaultPredicate::new().and(NotForContentType::const_new(XLSX_CONTENT_TYPE))
+}
+
+fn password_viewer_enabled_from_env(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 fn web_body_limit_bytes() -> usize {
@@ -153,6 +227,35 @@ fn normalize_public_base_path(value: Option<String>) -> String {
     }
 }
 
+/// Only directory-backed frontend responses pass through this middleware.
+/// ServeDir's not-found service returns index.html with 404 for SPA routes;
+/// revalidate that HTML too, without changing its existing status code. Other
+/// paths follow serve_embedded_asset's existing assets/ cache policy.
+async fn directory_static_cache_policy(request: Request<axum::body::Body>, next: middleware::Next) -> Response {
+    use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+
+    let path = request.uri().path().to_owned();
+    let mut response = next.run(request).await;
+    let is_html = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    let cache_control = if is_html
+        && (path.ends_with('/') || path.ends_with("/index.html") || response.status() == StatusCode::NOT_FOUND)
+    {
+        Some("no-cache")
+    } else if response.status().is_success() && path.starts_with("/assets/") {
+        Some("public, max-age=31536000, immutable")
+    } else {
+        None
+    };
+    if let Some(value) = cache_control {
+        response.headers_mut().insert(CACHE_CONTROL, value.parse().expect("valid static cache policy"));
+    }
+    response
+}
+
 fn add_public_base_path_redirect<S>(app: Router<S>, public_base_path: &str) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -173,6 +276,10 @@ where
             }
         }),
     )
+}
+
+fn help_requested(args: &[String]) -> bool {
+    args.iter().any(|arg| matches!(arg.as_str(), "-h" | "--help" | "/help"))
 }
 
 /// Frontend build output compiled into the binary by the `embed-static` feature.
@@ -258,7 +365,9 @@ fn mount_static_assets(mut app: Router, public_base_path: &str, source: Option<S
             use tower_http::services::{ServeDir, ServeFile};
             let index_path = static_dir.join("index.html");
             let serve_dir = ServeDir::new(static_dir).not_found_service(ServeFile::new(index_path));
-            app = app.fallback_service(serve_dir);
+            let static_router =
+                Router::new().fallback_service(serve_dir).layer(middleware::from_fn(directory_static_cache_policy));
+            app = app.fallback_service(static_router);
         }
         #[cfg(feature = "embed-static")]
         Some(StaticSource::Embedded) => {
@@ -276,7 +385,9 @@ fn mount_static_assets(mut app: Router, public_base_path: &str, source: Option<S
     match source {
         Some(StaticSource::Dir(static_dir)) => {
             use tower_http::services::ServeFile;
-            app = app.route_service(&format!("{public_base_path}/"), ServeFile::new(static_dir.join("index.html")));
+            let index_service = axum::routing::get_service(ServeFile::new(static_dir.join("index.html")))
+                .layer(middleware::from_fn(directory_static_cache_policy));
+            app = app.route(&format!("{public_base_path}/"), index_service);
         }
         #[cfg(feature = "embed-static")]
         Some(StaticSource::Embedded) => {
@@ -384,12 +495,28 @@ fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
     router
 }
 
-fn main() {
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if help_requested(&args) {
+        print!("{HELP_TEXT}");
+        return ExitCode::SUCCESS;
+    }
+
     let runtime = dbx_core::scheduled_backup::worker_runtime().expect("Failed to build tokio runtime");
-    runtime.block_on(serve());
+    match runtime.block_on(serve()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
-async fn serve() {
+fn web_mcp_startup_error(error: String) -> String {
+    format!("Failed to start DBX Web: invalid Web MCP configuration: {error}")
+}
+
+async fn serve() -> Result<(), String> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -442,10 +569,14 @@ async fn serve() {
         ))
     };
 
+    app_state.set_honor_fixed_ssh_local_ports(true);
+
     // Password hash: env var takes priority, then database
     let password_disabled = std::env::var("DBX_DISABLE_PASSWORD")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
+    let password_viewer_enabled =
+        password_viewer_enabled_from_env(std::env::var("DBX_DISABLE_PASSWORD_VIEWER").ok().as_deref());
 
     let password_hash = if password_disabled {
         None
@@ -464,22 +595,25 @@ async fn serve() {
     let web_mcp = Arc::new(if migration_ready {
         WebMcpRuntime::load(&app_state.storage, !password_disabled && password_hash.is_some())
             .await
-            .expect("Invalid DBX Web MCP configuration")
+            .map_err(web_mcp_startup_error)?
     } else {
         WebMcpRuntime::disabled()
     });
     let web_state = Arc::new(WebState {
         app: app_state,
         data_dir,
+        notes_roots: routes::docs::notes_roots_from_env(std::env::var_os("DBX_DOCS_NOTES_ROOTS").as_deref()),
         public_base_path: public_base_path.clone(),
         demo_mode,
         password_disabled,
+        password_viewer_enabled,
         password_hash: RwLock::new(password_hash),
         sessions: RwLock::new(HashSet::new()),
         sse_channels: RwLock::new(HashMap::new()),
         transfer_progress_channels: RwLock::new(HashMap::new()),
         table_import_channels: RwLock::new(HashMap::new()),
         sql_file_executions: RwLock::new(HashMap::new()),
+        sql_file_failure_logs: Default::default(),
         managed_sql_previews: Default::default(),
         nacos_imports: RwLock::new(HashMap::new()),
         login_rate_limit: tokio::sync::Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
@@ -491,6 +625,7 @@ async fn serve() {
 
     ssh_prompt::install_web_ssh_prompt_bridge(web_state.ssh_prompts.clone());
     routes::sql_file::start_sql_file_cleanup(&web_state);
+    routes::connection::start_connection_idle_sweeper(&web_state);
 
     let backup_root = std::env::var_os("DBX_BACKUP_ROOT")
         .map(std::path::PathBuf::from)
@@ -531,6 +666,9 @@ async fn serve() {
         .route("/connection/final-proxy-port", post(routes::connection::connection_final_proxy_port))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
         .route("/connection/check-health", post(routes::connection::check_connection_health))
+        .route("/connection/is-open", post(routes::connection::connection_is_open))
+        .route("/connection/liveness-events", get(routes::connection::connection_liveness_events))
+        .route("/connection/idle-closed-events", get(routes::connection::connection_idle_closed_events))
         .route("/connection/prewarm", post(routes::connection::prewarm_connection))
         .route("/connection/session-credential-status", post(routes::connection::session_credential_status))
         .route("/connection/forget-session-credential", post(routes::connection::forget_session_credential))
@@ -653,6 +791,7 @@ async fn serve() {
         .route("/schema/mysql/auto-increment", get(routes::schema::get_mysql_table_auto_increment))
         .route("/schema/schemas", get(routes::schema::list_schemas))
         .route("/schema/tables", get(routes::schema::list_tables))
+        .route("/schema/table-comment", get(routes::schema::get_table_comment))
         .route("/schema/objects", get(routes::schema::list_objects))
         .route("/schema/object-statistics", get(routes::schema::list_object_statistics))
         .route("/schema/completion-objects", get(routes::schema::list_completion_objects))
@@ -660,6 +799,21 @@ async fn serve() {
         .route("/schema/object-source", get(routes::schema::get_object_source))
         .route("/schema/event-info", get(routes::schema::get_event_info))
         .route("/schema/custom-type-details", get(routes::schema::get_custom_type_details))
+        .route("/schema/native-jobs/context", post(routes::native_jobs::open_context))
+        .route("/schema/native-jobs/list", post(routes::native_jobs::list))
+        .route("/schema/native-jobs/references", post(routes::native_jobs::references))
+        .route("/schema/native-jobs/read", post(routes::native_jobs::read))
+        .route("/schema/native-jobs/prepare", post(routes::native_jobs::prepare))
+        .route("/schema/native-jobs/apply", post(routes::native_jobs::apply))
+        .route("/schema/native-jobs/status", post(routes::native_jobs::status))
+        .route("/schema/native-jobs/cancel", post(routes::native_jobs::cancel))
+        .route("/schema/oracle-type-data", post(routes::schema::verify_oracle_type_data))
+        .route("/schema/oracle-type-evolution", post(routes::schema::prepare_oracle_type_evolution))
+        .route(
+            "/schema/oracle-type-management-snapshot",
+            get(routes::schema::get_oracle_type_management_snapshot)
+                .post(routes::schema::read_oracle_type_management_snapshot),
+        )
         .route("/schema/columns", get(routes::schema::list_columns))
         .route("/plugin/table-metadata", post(routes::schema::get_plugin_table_metadata))
         .route("/schema/all-columns", get(routes::schema::get_all_columns))
@@ -668,6 +822,7 @@ async fn serve() {
         .route("/schema/reference-key-columns", get(routes::schema::list_reference_key_columns))
         .route("/schema/reference-keys", get(routes::schema::list_reference_keys))
         .route("/schema/foreign-keys", get(routes::schema::list_foreign_keys))
+        .route("/schema/foreign-keys-for-database", get(routes::schema::list_foreign_keys_for_database))
         .route("/schema/triggers", get(routes::schema::list_triggers))
         .route("/schema/constraints", get(routes::schema::list_constraints))
         .route("/schema/partitions", get(routes::schema::list_partitions))
@@ -676,6 +831,13 @@ async fn serve() {
         .route("/schema/invalid-indexes", get(routes::schema::list_invalid_indexes))
         .route("/schema/subpartitions", get(routes::schema::list_subpartitions))
         .route("/schema/functions", get(routes::schema::list_functions))
+        .route("/schema/diff-routines", get(routes::schema::load_schema_diff_routines))
+        .route("/schema/routine-save", post(routes::schema::prepare_oracle_routine_save))
+        .route("/schema/routine-plan", post(routes::schema::prepare_oracle_routine_plan))
+        .route("/schema/routine-recovery", post(routes::schema::prepare_oracle_routine_recovery))
+        .route("/schema/routine-execute", post(routes::schema::execute_oracle_routine_operation))
+        .route("/schema/routine-operation", get(routes::schema::observe_oracle_routine_operation))
+        .route("/schema/routine-operation-references", post(routes::schema::update_oracle_routine_operation_references))
         .route("/schema/sequences", get(routes::schema::list_sequences))
         .route("/schema/rules", get(routes::schema::list_rules))
         .route("/schema/owners", get(routes::schema::list_owners))
@@ -708,6 +870,7 @@ async fn serve() {
         .route("/tab-runtime-cache/prune", post(routes::tab_runtime_cache::prune_tab_runtime_cache))
         .route("/tab-runtime-cache/owner", delete(routes::tab_runtime_cache::delete_tab_runtime_cache_owner))
         // Query
+        .merge(routes::pl_debug::router())
         .route("/query/execute", post(routes::query::execute_query))
         .route("/query/execute-conditional-update", post(routes::query::execute_conditional_update))
         .route("/query/execute-multi", post(routes::query::execute_multi))
@@ -730,6 +893,10 @@ async fn serve() {
         .route("/query/build-create-user-sql", post(routes::query::build_create_user_sql))
         .route("/query/build-table-select-sql", post(routes::query::build_table_select_sql))
         .route("/query/build-database-search-sql", post(routes::query::build_database_search_sql))
+        .route("/query/build-database-search-columns-sql", post(routes::query::build_database_search_columns_sql))
+        .route("/query/build-database-search-probe-sql", post(routes::query::build_database_search_probe_sql))
+        .route("/query/build-database-structure-search-sql", post(routes::query::build_database_structure_search_sql))
+        .route("/query/supports-database-structure-search", post(routes::query::supports_database_structure_search))
         .route("/query/build-search-result-where", post(routes::query::build_search_result_where))
         .route("/query/build-rename-object-sql", post(routes::query::build_rename_object_sql))
         .route("/query/build-rename-database-sql", post(routes::query::build_rename_database_sql))
@@ -749,9 +916,19 @@ async fn serve() {
         .route("/query/build-drop-schema-sql", post(routes::query::build_drop_schema_sql))
         .route("/query/build-duplicate-table-structure-sql", post(routes::query::build_duplicate_table_structure_sql))
         .route("/query/build-copy-table-data-sql", post(routes::query::build_copy_table_data_sql))
+        .route("/query/build-oracle-type-management-sql", post(routes::query::build_oracle_type_management_sql))
         .route(
             "/query/build-executable-object-source-statements",
             post(routes::query::build_executable_object_source_statements),
+        )
+        .route(
+            "/query/validate-oracle-executable-object-source",
+            post(routes::query::validate_oracle_executable_object_source),
+        )
+        .route("/query/prepare-oracle-trigger-sql", post(routes::query::prepare_oracle_trigger_sql))
+        .route(
+            "/query/fingerprint-oracle-routine-object-source",
+            post(routes::query::fingerprint_oracle_routine_object_source),
         )
         .route("/query/build-executable-object-source-sql", post(routes::query::build_executable_object_source_sql))
         .route("/query/build-editable-object-source", post(routes::query::build_editable_object_source))
@@ -759,7 +936,12 @@ async fn serve() {
             "/query/build-routine-rename-object-source-statements",
             post(routes::query::build_routine_rename_object_source_statements),
         )
+        .route("/query/rewrite-oracle-routine-references", post(routes::query::rewrite_oracle_routine_references))
+        .route("/query/rewrite-oracle-table-references", post(routes::query::rewrite_oracle_table_references))
         .route("/query/build-view-ddl-sql", post(routes::query::build_view_ddl_sql))
+        .route("/query/parse-oracle-object-name", post(routes::query::parse_oracle_object_name))
+        .route("/query/build-oracle-view-rename-source", post(routes::query::build_oracle_view_rename_source))
+        .route("/query/review-oracle-view-rename-source", post(routes::query::review_oracle_view_rename_source))
         .route("/query/build-table-structure-change-sql", post(routes::query::build_table_structure_change_sql))
         .route("/query/build-table-owner-change-sql", post(routes::query::build_table_owner_change_sql))
         .route("/query/build-table-partition-operation-sql", post(routes::query::build_table_partition_operation_sql))
@@ -820,6 +1002,11 @@ async fn serve() {
         .route("/query/cancel", post(routes::query::cancel_query))
         .route("/query/cancel-conditional-update", post(routes::query::cancel_conditional_update))
         .route("/query/close-session", post(routes::query::close_query_session))
+        .route("/query/large-value/chunk", post(routes::query::read_large_value_chunk))
+        .route("/query/large-value/release", post(routes::query::release_large_value))
+        .route("/query/large-value/download", post(routes::query::prepare_large_value_download))
+        .route("/query/large-value/export", post(routes::query::prepare_snapshot_export))
+        .route("/query/large-value/download/{id}", get(routes::query::download_large_value))
         .route("/query/close-client-session", post(routes::query::close_client_connection_session))
         .route("/export/query-result-json", post(routes::text_export::export_query_result_json))
         .route("/export/query-result-markdown", post(routes::text_export::export_query_result_markdown))
@@ -828,8 +1015,10 @@ async fn serve() {
         .route("/redis/list-databases", post(routes::redis::list_databases))
         .route("/redis/scan-keys", post(routes::redis::scan_keys))
         .route("/redis/scan-keys-batch", post(routes::redis::scan_keys_batch))
+        .route("/redis/key-metadata-batch", post(routes::redis::key_metadata_batch))
         .route("/redis/scan-values", post(routes::redis::scan_values))
         .route("/redis/get-value", post(routes::redis::get_value))
+        .route("/redis/get-raw-value", post(routes::redis::get_raw_value))
         .route("/redis/get-ttl", post(routes::redis::get_ttl))
         .route("/redis/get-stream-entries", post(routes::redis::get_stream_entries))
         .route("/redis/get-stream-groups", post(routes::redis::get_stream_groups))
@@ -1188,6 +1377,7 @@ async fn serve() {
             "/saved-sql/{id}",
             get(routes::saved_sql::load_saved_sql_file).delete(routes::saved_sql::delete_saved_sql_file),
         )
+        .route("/saved-sql/{id}/default-content", post(routes::saved_sql::save_default_query_content))
         .route("/saved-sql/folders", post(routes::saved_sql::save_saved_sql_folder))
         .route("/saved-sql/folders/{id}", delete(routes::saved_sql::delete_saved_sql_folder))
         // AI
@@ -1228,6 +1418,9 @@ async fn serve() {
         // Transfer
         .route("/transfer/start", post(routes::transfer::start_transfer))
         .route("/transfer/ownership-preview", post(routes::transfer::preview_transfer_ownership))
+        .route("/task-runs", get(routes::task_history::list_task_runs))
+        .route("/task-runs/{run_id}", get(routes::task_history::get_task_run))
+        .route("/task-runs/{run_id}/items", get(routes::task_history::list_task_run_items))
         .route("/transfer/progress/{transferId}", get(routes::transfer::transfer_progress))
         .route("/transfer/cancel", post(routes::transfer::cancel_transfer))
         .route("/transfer/sort-tables-by-fk", post(routes::transfer::sort_tables_by_fk_dependency))
@@ -1261,10 +1454,14 @@ async fn serve() {
                 .layer(DefaultBodyLimit::max(routes::sql_file::sql_file_upload_hard_cap_bytes())),
         )
         .route("/sql-file/execute", post(routes::sql_file::execute_sql_file))
+        .route("/sql-file/preview/refresh", post(routes::sql_file::refresh_sql_file_preview))
         .route("/sql-file/preview/release", post(routes::sql_file::release_sql_file_preview))
         .route("/sql-file/tables", post(routes::sql_file::inspect_sql_file_tables))
         .route("/sql-file/progress/{executionId}", get(routes::sql_file::sql_file_progress))
         .route("/sql-file/cancel", post(routes::sql_file::cancel_sql_file))
+        .route("/sql-file/failure-log/text", post(routes::sql_file::sql_file_failure_log_text))
+        .route("/sql-file/failure-log/{executionId}", get(routes::sql_file::sql_file_failure_log_download))
+        .route("/sql-file/failure-log/{executionId}/info", get(routes::sql_file::sql_file_failure_log_info))
         // Table import
         .route(
             "/import/preview",
@@ -1300,9 +1497,18 @@ async fn serve() {
             "/app-settings/mcp-policy",
             get(routes::app_settings::load_mcp_global_policy).put(routes::app_settings::save_mcp_global_policy),
         )
+        .route("/app-settings/mcp-tool-catalog", get(routes::app_settings::load_mcp_tool_catalog))
+        .route("/app-settings/mcp-access-policy", get(routes::app_settings::load_mcp_access_policy))
+        .route("/app-settings/mcp-access-policy/recover", post(routes::app_settings::reset_invalid_mcp_access_policy))
+        .route("/app-settings/mcp-access-policy/plugin-scope", put(routes::app_settings::set_mcp_plugin_scope_rule))
+        .route("/app-settings/plugin-mcp", get(routes::app_settings::list_plugin_mcp_views))
+        .route("/app-settings/plugin-mcp/view", post(routes::app_settings::load_plugin_mcp_view))
+        .route("/app-settings/plugin-mcp/scopes", post(routes::app_settings::list_plugin_mcp_scopes))
+        .route("/app-settings/plugin-mcp/grant", put(routes::app_settings::save_plugin_mcp_grant))
         .route("/app-settings/mcp-http-status", get(routes::app_settings::load_web_mcp_http_status))
         .route("/app-settings/mcp-http", put(routes::app_settings::save_web_mcp_http_settings))
         .route("/app-settings/mcp-http/rotate-token", post(routes::app_settings::rotate_web_mcp_token))
+        .route("/app-settings/web-capabilities", get(routes::app_settings::load_web_capabilities))
         .route(
             "/app-settings/max-agent-turns",
             get(routes::app_settings::load_max_agent_turns).put(routes::app_settings::save_max_agent_turns),
@@ -1350,6 +1556,9 @@ async fn serve() {
         .route("/cloud-sync/snippet/token-status", post(routes::cloud_sync::snippet_token_status))
         .route("/cloud-sync/snippet/save-token", post(routes::cloud_sync::save_snippet_saved_token))
         .route("/cloud-sync/snippet/forget-token", post(routes::cloud_sync::forget_snippet_saved_token))
+        .route("/cloud-sync/snippet/passphrase-status", post(routes::cloud_sync::snippet_passphrase_status))
+        .route("/cloud-sync/snippet/save-passphrase", post(routes::cloud_sync::save_snippet_saved_passphrase))
+        .route("/cloud-sync/snippet/forget-passphrase", post(routes::cloud_sync::forget_snippet_saved_passphrase))
         .route("/cloud-sync/snippet/settings", post(routes::cloud_sync::snippet_sync_settings))
         .route("/cloud-sync/snippet/save-id", post(routes::cloud_sync::save_snippet_sync_id))
         .route("/cloud-sync/snippet/retry-legacy-cleanup", post(routes::cloud_sync::retry_snippet_legacy_cleanup))
@@ -1375,7 +1584,7 @@ async fn serve() {
         .layer(CompressionLayer::new().compress_when(web_compression_predicate()))
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
-    let mcp_router = web_mcp_router(&web_state).expect("Invalid DBX Web MCP configuration");
+    let mcp_router = web_mcp_router(&web_state).map_err(web_mcp_startup_error)?;
     app = app.merge(
         mcp_router
             .layer(middleware::from_fn_with_state(web_state.clone(), web_mcp_demo_gate))
@@ -1427,40 +1636,101 @@ async fn serve() {
     } else if std::env::var("DBX_PASSWORD").is_ok() {
         tracing::info!("Password protection is enabled");
     }
+    if !password_viewer_enabled {
+        tracing::info!("Saved connection password viewing is disabled");
+    }
     if demo_mode {
         tracing::info!("Demo mode is enabled: connection/plugin/AI mutations are blocked");
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await.expect("Failed to bind address");
     let shutdown_state = web_state.app.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            #[cfg(unix)]
-            {
-                let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("Failed to listen for SIGTERM");
-                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    let server_shutdown = tokio_util::sync::CancellationToken::new();
+    let server_shutdown_trigger = server_shutdown.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut terminate: Option<tokio::signal::unix::Signal> =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::error!("Failed to install SIGTERM handler: {e}; continuing with Ctrl+C only");
+                        None
+                    }
+                };
+            tokio::select! {
+                res = tokio::signal::ctrl_c() => {
+                    if let Err(e) = res {
+                        tracing::error!("Failed to listen for Ctrl+C: {e}");
+                    } else {
+                        tracing::info!("Shutdown signal received (Ctrl+C)");
+                    }
+                }
+                _ = async {
+                    match terminate.as_mut() {
+                        Some(signal) => {
+                            signal.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    tracing::info!("Shutdown signal received (SIGTERM)");
+                }
             }
-            #[cfg(not(unix))]
-            let _ = tokio::signal::ctrl_c().await;
-            backup_stop.cancel();
-        })
-        .await
-        .expect("Server error");
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(60), backup_worker).await;
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::error!("Failed to listen for Ctrl+C: {e}");
+            } else {
+                tracing::info!("Shutdown signal received (Ctrl+C)");
+            }
+        }
+        backup_stop.cancel();
+        server_shutdown_trigger.cancel();
+    });
+
+    let shutdown_wait = server_shutdown.clone();
+    let serve_future = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_wait.cancelled().await;
+    });
+
+    // If graceful shutdown of HTTP connections takes longer than 5 seconds, abort to ensure prompt termination on Ctrl+C.
+    // Non-zero exit codes keep systemd's Restart=on-failure meaningful: a serve error or an
+    // undrained backup worker must not look like a clean stop.
+    let mut exit_code = 0i32;
+    tokio::select! {
+        res = serve_future => {
+            if let Err(e) = res {
+                tracing::error!("Server error: {e}");
+                exit_code = 1;
+            }
+        }
+        _ = async {
+            server_shutdown.cancelled().await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        } => {
+            tracing::warn!("Graceful HTTP shutdown timed out after 5s; proceeding with teardown");
+        }
+    }
+    if tokio::time::timeout(std::time::Duration::from_secs(5), backup_worker).await.is_err() {
+        tracing::warn!("Scheduled backup worker did not drain within 5s; exiting with failure status");
+        exit_code = 1;
+    }
     shutdown_state.shutdown(std::time::Duration::from_secs(3)).await;
+    std::process::exit(exit_code);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        mount_static_assets, normalize_public_base_path, web_agent_dir_from_env, web_body_limit_bytes_from_value,
-        web_compression_predicate, StaticSource, XLSX_CONTENT_TYPE,
+        mount_static_assets, normalize_public_base_path, password_viewer_enabled_from_env, web_agent_dir_from_env,
+        web_body_limit_bytes_from_value, web_compression_predicate, StaticSource, XLSX_CONTENT_TYPE,
     };
     use crate::routes::table_import;
     use axum::body::Body;
     use axum::extract::{DefaultBodyLimit, Multipart};
-    use axum::http::header::CONTENT_TYPE;
+    use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
     use axum::http::{Response, StatusCode};
     use axum::routing::{get, post};
     use axum::Router;
@@ -1524,6 +1794,15 @@ mod tests {
         assert_eq!(normalize_public_base_path(None), "/");
         assert_eq!(normalize_public_base_path(Some("".to_string())), "/");
         assert_eq!(normalize_public_base_path(Some("/".to_string())), "/");
+    }
+
+    #[test]
+    fn password_viewer_enabled_defaults_to_true_and_accepts_truthy_disable_values() {
+        assert!(password_viewer_enabled_from_env(None));
+        assert!(password_viewer_enabled_from_env(Some("false")));
+        for value in ["1", "true", "yes", "on", " TRUE "] {
+            assert!(!password_viewer_enabled_from_env(Some(value)), "{value}");
+        }
     }
 
     #[test]
@@ -1626,6 +1905,9 @@ mod tests {
         std::fs::create_dir_all(&static_dir).expect("create static directory");
         std::fs::write(static_dir.join("index.html"), "subpath index").expect("write index");
         std::fs::write(static_dir.join("app.js"), "subpath asset").expect("write asset");
+        std::fs::create_dir_all(static_dir.join("assets")).expect("create assets directory");
+        std::fs::write(static_dir.join("assets/app-12136abc.js"), "hashed asset").expect("write hashed asset");
+        std::fs::write(static_dir.join("assets/plain.js"), "unversioned asset").expect("write plain asset");
 
         for public_base_path in ["/dbx", "/xxxx/rsu"] {
             let router = mount_static_assets(
@@ -1667,7 +1949,50 @@ mod tests {
                 .await
                 .expect("GET trailing slash base path");
             assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()), Some("no-cache"));
             assert_eq!(response.text().await.expect("read index response"), "subpath index");
+
+            let response = client
+                .get(format!("http://{address}{public_base_path}/index.html"))
+                .send()
+                .await
+                .expect("GET explicit index");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()), Some("no-cache"));
+            assert_eq!(response.text().await.expect("read explicit index"), "subpath index");
+
+            let response = client
+                .get(format!("http://{address}{public_base_path}/route/within/app"))
+                .send()
+                .await
+                .expect("GET SPA fallback");
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+            assert_eq!(response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()), Some("no-cache"));
+            assert_eq!(response.text().await.expect("read fallback response"), "subpath index");
+
+            for asset in ["app-12136abc.js", "plain.js"] {
+                let response = client
+                    .get(format!("http://{address}{public_base_path}/assets/{asset}"))
+                    .send()
+                    .await
+                    .expect("GET asset");
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                assert_eq!(
+                    response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+                    Some("public, max-age=31536000, immutable")
+                );
+            }
+
+            let response = client
+                .get(format!("http://{address}{public_base_path}/assets/missing.js"))
+                .send()
+                .await
+                .expect("GET missing asset");
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+            assert_ne!(
+                response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+                Some("public, max-age=31536000, immutable")
+            );
 
             let response = client
                 .get(format!("http://{address}{public_base_path}/app.js"))
@@ -1675,11 +2000,13 @@ mod tests {
                 .await
                 .expect("GET static asset");
             assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert!(response.headers().get(CACHE_CONTROL).is_none());
             assert_eq!(response.text().await.expect("read asset response"), "subpath asset");
 
             let response =
                 client.get(format!("http://{address}{public_base_path}/api/ping")).send().await.expect("GET API route");
             assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert!(response.headers().get(CACHE_CONTROL).is_none());
             assert_eq!(response.text().await.expect("read API response"), "pong");
 
             server.abort();
@@ -1694,6 +2021,8 @@ mod tests {
         std::fs::create_dir_all(&static_dir).expect("create static directory");
         std::fs::write(static_dir.join("index.html"), "root index").expect("write index");
         std::fs::write(static_dir.join("app.js"), "root asset").expect("write asset");
+        std::fs::create_dir_all(static_dir.join("assets")).expect("create assets directory");
+        std::fs::write(static_dir.join("assets/app-12136abc.js"), "hashed asset").expect("write hashed asset");
         let router = mount_static_assets(
             Router::new().route("/api/ping", get(|| async { "pong" })),
             "/",
@@ -1709,8 +2038,33 @@ mod tests {
         for (request_path, expected_body) in [("/", "root index"), ("/app.js", "root asset"), ("/api/ping", "pong")] {
             let response = client.get(format!("http://{address}{request_path}")).send().await.expect("GET root route");
             assert_eq!(response.status(), reqwest::StatusCode::OK);
+            if request_path == "/" {
+                assert_eq!(
+                    response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+                    Some("no-cache")
+                );
+            } else {
+                assert!(response.headers().get(CACHE_CONTROL).is_none());
+            }
             assert_eq!(response.text().await.expect("read root response"), expected_body);
         }
+
+        for request_path in ["/index.html", "/route/within/app"] {
+            let response = client.get(format!("http://{address}{request_path}")).send().await.expect("GET index");
+            assert_eq!(
+                response.status(),
+                if request_path == "/index.html" { reqwest::StatusCode::OK } else { reqwest::StatusCode::NOT_FOUND }
+            );
+            assert_eq!(response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()), Some("no-cache"));
+            assert_eq!(response.text().await.expect("read index response"), "root index");
+        }
+
+        let response = client.get(format!("http://{address}/assets/app-12136abc.js")).send().await.expect("GET asset");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+            Some("public, max-age=31536000, immutable")
+        );
 
         server.abort();
         std::fs::remove_dir_all(static_dir).expect("remove static directory");

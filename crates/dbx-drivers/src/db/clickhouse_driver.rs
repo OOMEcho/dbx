@@ -1,3 +1,4 @@
+use dbx_sql_core::sql_risk::{classify_sql_risk_for_database, SqlRisk};
 use futures::StreamExt;
 use reqwest::{Certificate, Client as HttpClient};
 use serde::Deserialize;
@@ -7,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{http_client_builder, with_connection_timeout};
 use crate::execution::{canceled_error, MAX_ROWS};
+use crate::models::connection::DatabaseType;
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{ColumnInfo, DatabaseInfo, IndexInfo, ObjectStatistics, QueryResult, TableInfo};
 
@@ -34,7 +36,22 @@ impl ChClient {
         extra_params: Option<&str>,
         timeout: Duration,
     ) -> Result<Self, String> {
+        Self::new_with_ca_cert_and_proxy(url, username, password, ca_cert_path, extra_params, None, timeout)
+    }
+
+    pub fn new_with_ca_cert_and_proxy(
+        url: &str,
+        username: Option<String>,
+        password: Option<String>,
+        ca_cert_path: Option<&str>,
+        extra_params: Option<&str>,
+        proxy: Option<reqwest::Proxy>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
         let mut builder = http_client_builder(timeout);
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(proxy);
+        }
         if let Some(path) = ca_cert_path.map(str::trim).filter(|path| !path.is_empty()) {
             let path = expand_cert_path(path);
             let cert_bytes =
@@ -529,6 +546,7 @@ fn clickhouse_index_from_skipping_row(row: &[serde_json::Value]) -> IndexInfo {
     let index_type = row.get(2).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let granularity = json_value_as_u64(row.get(3));
     IndexInfo {
+        owner: None,
         name: row.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),
         columns: split_clickhouse_expression_list(row.get(1).and_then(|v| v.as_str()).unwrap_or("")),
         is_unique: false,
@@ -541,6 +559,9 @@ fn clickhouse_index_from_skipping_row(row: &[serde_json::Value]) -> IndexInfo {
         included_columns: None,
         comment: None,
         key_is_expression: Vec::new(),
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![],
         key_options: Vec::new(),
         constraint_backed: false,
@@ -583,8 +604,10 @@ fn limited_query_result(result: ChJsonResult, execution_time_ms: u128, max_rows:
     QueryResult {
         columns,
         column_types,
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
+        raw_key_cells: Vec::new(),
         spatial_values: vec![],
         rows,
         affected_rows: 0,
@@ -790,6 +813,10 @@ pub async fn list_indexes(client: &ChClient, database: &str, table: &str) -> Res
         .filter(|value| !value.trim().is_empty())
     {
         indexes.push(IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "PRIMARY".to_string(),
             columns: split_clickhouse_expression_list(primary_key),
             is_unique: false,
@@ -823,7 +850,10 @@ pub async fn execute_query_with_max_rows(
     let start = Instant::now();
     let row_limit = query_result_row_limit(max_rows);
 
-    if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"]) {
+    // WITH can prefix INSERT as well as SELECT; successful writes return no JSON result set.
+    let is_cte_write = starts_with_executable_sql_keyword(sql, &["WITH"])
+        && classify_sql_risk_for_database(sql, DatabaseType::ClickHouse).is_ok_and(|risk| risk != SqlRisk::ReadOnly);
+    if !is_cte_write && starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"]) {
         let result = ch_query_with_limit(client, sql, Some(database), QueryResultLimit::Limited(row_limit + 1)).await?;
         Ok(limited_query_result(result, start.elapsed().as_millis(), Some(row_limit)))
     } else {
@@ -842,8 +872,10 @@ pub async fn execute_query_with_max_rows(
         Ok(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
+            raw_key_cells: Vec::new(),
             spatial_values: vec![],
             rows: vec![],
             affected_rows: 0,
@@ -863,7 +895,7 @@ pub async fn execute_query_with_max_rows(
 mod tests {
     use super::*;
 
-    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+    async fn read_http_request<Stream: tokio::io::AsyncRead + Unpin>(socket: &mut Stream) -> String {
         use tokio::io::AsyncReadExt;
 
         let mut request = Vec::new();
@@ -892,7 +924,7 @@ mod tests {
         String::from_utf8(request).unwrap()
     }
 
-    async fn write_http_response(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+    async fn write_http_response<Stream: tokio::io::AsyncWrite + Unpin>(socket: &mut Stream, status: &str, body: &str) {
         use tokio::io::AsyncWriteExt;
 
         let response = format!(
@@ -900,6 +932,192 @@ mod tests {
             body.len()
         );
         socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    const PROXY_TLS_HOST: &str = "clickhouse.proxy.test";
+
+    fn proxy_test_tls_acceptor(certificate_host: &str) -> (openssl::ssl::SslAcceptor, tempfile::NamedTempFile) {
+        use openssl::asn1::Asn1Time;
+        use openssl::bn::BigNum;
+        use openssl::ec::{EcGroup, EcKey};
+        use openssl::hash::MessageDigest;
+        use openssl::nid::Nid;
+        use openssl::pkey::PKey;
+        use openssl::ssl::{NameType, SniError, SslAcceptor, SslMethod};
+        use openssl::x509::extension::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName};
+        use openssl::x509::{X509NameBuilder, X509};
+        use std::io::Write;
+
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let ca_key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let mut ca_name = X509NameBuilder::new().unwrap();
+        ca_name.append_entry_by_text("CN", "DBX proxy test CA").unwrap();
+        let ca_name = ca_name.build();
+        let mut ca = X509::builder().unwrap();
+        ca.set_version(2).unwrap();
+        ca.set_serial_number(&BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap()).unwrap();
+        ca.set_subject_name(&ca_name).unwrap();
+        ca.set_issuer_name(&ca_name).unwrap();
+        ca.set_pubkey(&ca_key).unwrap();
+        ca.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        ca.set_not_after(&Asn1Time::days_from_now(1).unwrap()).unwrap();
+        ca.append_extension(BasicConstraints::new().critical().ca().build().unwrap()).unwrap();
+        ca.append_extension(KeyUsage::new().critical().key_cert_sign().crl_sign().build().unwrap()).unwrap();
+        ca.sign(&ca_key, MessageDigest::sha256()).unwrap();
+        let ca = ca.build();
+        let mut ca_file = tempfile::NamedTempFile::new().unwrap();
+        ca_file.write_all(&ca.to_pem().unwrap()).unwrap();
+
+        let server_key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let mut server_name = X509NameBuilder::new().unwrap();
+        server_name.append_entry_by_text("CN", certificate_host).unwrap();
+        let mut certificate = X509::builder().unwrap();
+        certificate.set_version(2).unwrap();
+        certificate.set_serial_number(&BigNum::from_u32(2).unwrap().to_asn1_integer().unwrap()).unwrap();
+        certificate.set_subject_name(&server_name.build()).unwrap();
+        certificate.set_issuer_name(ca.subject_name()).unwrap();
+        certificate.set_pubkey(&server_key).unwrap();
+        certificate.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        certificate.set_not_after(&Asn1Time::days_from_now(1).unwrap()).unwrap();
+        certificate.append_extension(BasicConstraints::new().critical().build().unwrap()).unwrap();
+        certificate.append_extension(KeyUsage::new().critical().digital_signature().build().unwrap()).unwrap();
+        certificate.append_extension(ExtendedKeyUsage::new().server_auth().build().unwrap()).unwrap();
+        let names = SubjectAlternativeName::new()
+            .dns(certificate_host)
+            .build(&certificate.x509v3_context(Some(&ca), None))
+            .unwrap();
+        certificate.append_extension(names).unwrap();
+        certificate.sign(&ca_key, MessageDigest::sha256()).unwrap();
+
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls_server()).unwrap();
+        acceptor.set_certificate(&certificate.build()).unwrap();
+        acceptor.set_private_key(&server_key).unwrap();
+        acceptor.set_servername_callback(|connection, _alert| {
+            if connection.servername(NameType::HOST_NAME) == Some(PROXY_TLS_HOST) {
+                Ok(())
+            } else {
+                Err(SniError::ALERT_FATAL)
+            }
+        });
+        (acceptor.build(), ca_file)
+    }
+
+    async fn check_https_proxy(
+        proxy_type: &'static str,
+        credentials: Option<(&'static str, &'static str)>,
+        target_port: u16,
+        certificate_host: &str,
+    ) -> Result<(), String> {
+        use base64::Engine;
+        use openssl::ssl::{NameType, Ssl};
+        use std::pin::Pin;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (acceptor, ca_file) = proxy_test_tls_acceptor(certificate_host);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            if proxy_type == "socks5h" {
+                let mut greeting = [0_u8; 2];
+                socket.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting[0], 5);
+                let mut methods = vec![0_u8; greeting[1] as usize];
+                socket.read_exact(&mut methods).await.unwrap();
+                let method = if credentials.is_some() { 2 } else { 0 };
+                assert!(methods.contains(&method));
+                socket.write_all(&[5, method]).await.unwrap();
+                if let Some((username, password)) = credentials {
+                    let mut auth = [0_u8; 2];
+                    socket.read_exact(&mut auth).await.unwrap();
+                    assert_eq!(auth[0], 1);
+                    let mut user_bytes = vec![0_u8; auth[1] as usize];
+                    socket.read_exact(&mut user_bytes).await.unwrap();
+                    assert_eq!(user_bytes, username.as_bytes());
+                    let mut password_length = [0_u8; 1];
+                    socket.read_exact(&mut password_length).await.unwrap();
+                    let mut password_bytes = vec![0_u8; password_length[0] as usize];
+                    socket.read_exact(&mut password_bytes).await.unwrap();
+                    assert_eq!(password_bytes, password.as_bytes());
+                    socket.write_all(&[1, 0]).await.unwrap();
+                }
+                let mut request = [0_u8; 5];
+                socket.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request[..4], &[5, 1, 0, 3]);
+                let mut hostname = vec![0_u8; request[4] as usize];
+                socket.read_exact(&mut hostname).await.unwrap();
+                assert_eq!(hostname, PROXY_TLS_HOST.as_bytes());
+                let mut port_bytes = [0_u8; 2];
+                socket.read_exact(&mut port_bytes).await.unwrap();
+                assert_eq!(u16::from_be_bytes(port_bytes), target_port);
+                socket.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).await.unwrap();
+            } else {
+                let request = read_http_request(&mut socket).await;
+                assert!(request.starts_with(&format!("CONNECT {PROXY_TLS_HOST}:{target_port} HTTP/1.1\r\n")));
+                if let Some((username, password)) = credentials {
+                    let expected = format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+                    );
+                    let authorization = request.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("proxy-authorization").then(|| value.trim())
+                    });
+                    assert_eq!(authorization, Some(expected.as_str()));
+                }
+                socket.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+            }
+            let mut socket = tokio_openssl::SslStream::new(Ssl::new(acceptor.context()).unwrap(), socket).unwrap();
+            if Pin::new(&mut socket).accept().await.is_err() {
+                return false;
+            }
+            assert_eq!(socket.ssl().servername(NameType::HOST_NAME), Some(PROXY_TLS_HOST));
+            let request = read_http_request(&mut socket).await;
+            let authority =
+                if target_port == 443 { PROXY_TLS_HOST.to_string() } else { format!("{PROXY_TLS_HOST}:{target_port}") };
+            assert!(request.lines().any(|line| line.eq_ignore_ascii_case(&format!("host: {authority}"))));
+            assert!(request.lines().next().unwrap().contains("max_threads=1"));
+            write_http_response(&mut socket, "200 OK", "1\n").await;
+            true
+        });
+        let mut proxy = reqwest::Proxy::all(format!("{proxy_type}://{address}")).unwrap();
+        if let Some((username, password)) = credentials {
+            proxy = proxy.basic_auth(username, password);
+        }
+        let client = ChClient::new_with_ca_cert_and_proxy(
+            &format!("https://{PROXY_TLS_HOST}:{target_port}"),
+            None,
+            None,
+            ca_file.path().to_str(),
+            Some("ssl=true&max_threads=1"),
+            Some(proxy),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let result = test_connection(&client, Duration::from_secs(10)).await;
+        let tls_accepted = tokio::time::timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
+        assert_eq!(result.is_ok(), tls_accepted);
+        result
+    }
+
+    #[tokio::test]
+    async fn socks5_https_proxy_preserves_sni_and_remote_dns() {
+        check_https_proxy("socks5h", None, 443, PROXY_TLS_HOST).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_socks5_https_proxy_preserves_authority() {
+        check_https_proxy("socks5h", Some(("proxy:user", "p@ss/word#")), 8443, PROXY_TLS_HOST).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_connect_preserves_sni_and_authority() {
+        check_https_proxy("http", Some(("proxy-user", "p@ss/word#")), 8443, PROXY_TLS_HOST).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_https_proxy_rejects_mismatched_certificate_hostname() {
+        assert!(check_https_proxy("socks5h", None, 443, "wrong.proxy.test").await.is_err());
     }
 
     async fn spawn_readonly_fallback_server(
@@ -928,6 +1146,70 @@ mod tests {
         });
 
         (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn cte_insert_accepts_empty_command_response_without_result_limits() {
+        let sql = "WITH a AS (SELECT 1 AS eid), b AS (SELECT 1 AS eid) \
+                   INSERT INTO test123(eid) SELECT b.eid FROM a LEFT JOIN b ON a.eid = b.eid";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            write_http_response(&mut socket, "200 OK", "").await;
+            request
+        });
+        let client = ChClient::new(&format!("http://{address}"), None, None, Duration::from_secs(5));
+        let result = execute_query_with_max_rows(&client, "default", sql, Some(2)).await;
+        let request = server.await.unwrap();
+
+        let result = result.expect("successful CTE INSERT returns an empty command response, not JSON");
+        assert!(result.columns.is_empty());
+        assert!(result.rows.is_empty());
+        assert!(!result.truncated);
+        let target = request.lines().next().unwrap();
+        assert!(!target.contains("max_result_rows"), "writes must not inherit query result limits");
+        assert!(!target.contains("result_overflow_mode"));
+        assert!(request.ends_with(sql));
+    }
+
+    #[tokio::test]
+    async fn cte_select_preserves_result_decoding_and_limits() {
+        for sql in [
+            "WITH a AS (SELECT 1 AS eid) SELECT eid FROM a",
+            "/* INSERT INTO t */ WITH 'INSERT INTO t' AS label SELECT 1 AS eid",
+            "WITH a AS (SELECT 1 AS `insert`) SELECT `insert` AS eid FROM a",
+            "WITH a AS (SELECT 1 AS insert) SELECT insert AS eid FROM a",
+            "WITH replace('a', 'a', 'b') AS label SELECT 1 AS eid",
+            "EXPLAIN WITH a AS (SELECT 1) INSERT INTO t SELECT * FROM a",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                write_http_response(
+                    &mut socket,
+                    "200 OK",
+                    r#"{"meta":[{"name":"eid","type":"UInt64"}],"data":[[1],[2],[3]],"rows":3}"#,
+                )
+                .await;
+                request
+            });
+            let client = ChClient::new(&format!("http://{address}"), None, None, Duration::from_secs(5));
+            let result = execute_query_with_max_rows(&client, "default", sql, Some(2)).await.unwrap();
+            let request = server.await.unwrap();
+
+            assert_eq!(result.columns, vec!["eid"], "{sql}");
+            assert_eq!(result.column_types, vec!["UInt64"], "{sql}");
+            assert_eq!(result.rows, vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]], "{sql}");
+            assert!(result.truncated, "{sql}");
+            let target = request.lines().next().unwrap();
+            assert!(target.contains("max_result_rows=3"), "{sql}");
+            assert!(target.contains("result_overflow_mode=break"), "{sql}");
+            assert!(request.ends_with(sql));
+        }
     }
 
     #[test]

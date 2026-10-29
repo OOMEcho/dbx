@@ -24,6 +24,7 @@ import {
   addDriverInstallQueue,
   driverInstallProgressChannel,
   driverInstallProgressPercent,
+  formatDriverInstallProgressText,
   isDriverInstallCanceledError,
   isDriverInstallCancellationTarget,
   isDriverInstallProgressForOperation,
@@ -40,7 +41,7 @@ import { translateBackendError } from "@/i18n/backend-errors";
 import { runAgentOfflineExportAction } from "@/lib/driverStore/agentOfflineExportFlow";
 import { DRIVER_CATEGORIES, getCategoryForAgentDriver, assertAgentDriverCategoriesComplete } from "@/lib/connection/driver-category-definitions";
 import { hasAnyUpdatableDriverMatching, countInstalledDrivers, countAvailableDrivers, partitionDriversByInstallStatus, upgradeAllDriverTypes, upgradeAllMatchesFullUpdateSet, type DriverInstallStatusFilter } from "@/lib/connection/driverListFilter";
-import { notifyComponentUpdatesChanged } from "@/lib/updates/componentUpdateEvents";
+import { COMPONENT_DRIVER_UPDATES_CHANGED_EVENT, notifyComponentUpdatesChanged } from "@/lib/updates/componentUpdateEvents";
 import { updateBlockerLabels } from "@/lib/updates/componentUpdateOrchestration";
 
 const { t } = useI18n();
@@ -182,8 +183,7 @@ async function applyDriverStoreDir(kind: DriverStoreDirKind, newDir: string | nu
     };
     toast(t("driverStore.driverStoreDirSuccess", { target }));
     // Restart the app to use the new paths
-    const { relaunch } = await import("@tauri-apps/plugin-process");
-    relaunch();
+    await api.relaunchApp();
   } catch (e: any) {
     toast(t("driverStore.driverStoreDirMigrationFailed", { error: backendError(e) }), 5000);
   } finally {
@@ -244,15 +244,7 @@ const installedJres = computed(() => {
 });
 
 function formatProgressText(p: DriverInstallProgress | null | undefined): string {
-  if (!p) return "";
-  if (p.step === "jre-extract") return t("driverStore.progressJreExtract");
-  if (p.step === "jdbc-plugin-extract") return t("driverStore.progressJdbcPluginExtract");
-  const label = p.step === "jre" ? t("driverStore.progressDownloadJre") : p.step === "jdbc-plugin" ? t("driverStore.progressDownloadJdbcPlugin") : t("driverStore.progressDownloadDriver");
-  if (!p.total) return `${label}...`;
-  const pct = Math.round(((p.downloaded ?? 0) / p.total) * 100);
-  const dl = formatSize(p.downloaded ?? 0);
-  const total = formatSize(p.total);
-  return `${label}  ${dl} / ${total}  (${pct}%)`;
+  return formatDriverInstallProgressText(p, t);
 }
 
 function getAgentProgressText(dbType: string): string {
@@ -274,12 +266,10 @@ function getAgentProgressPercent(dbType: string): number | null {
   return next ?? lastAgentProgressPercent[dbType] ?? null;
 }
 
-const jdbcPluginProgressNumber = computed(() => {
-  const next = driverInstallProgressPercent(jdbcPluginProgress.value);
-  if (next !== null) {
-    lastJdbcPluginProgressPercent.value = next;
-  }
-  return next ?? lastJdbcPluginProgressPercent.value;
+const jdbcPluginProgressNumber = computed(() => driverInstallProgressPercent(jdbcPluginProgress.value) ?? lastJdbcPluginProgressPercent.value);
+watch(jdbcPluginProgress, (progress) => {
+  const next = driverInstallProgressPercent(progress);
+  if (next !== null) lastJdbcPluginProgressPercent.value = next;
 });
 
 function resetAgentInstallProgress() {
@@ -429,6 +419,10 @@ async function forceRefresh() {
   } finally {
     refreshing.value = false;
   }
+}
+
+function handleComponentDriverUpdatesChanged() {
+  void Promise.allSettled([forceRefresh(), loadJdbcDrivers(), loadJdbcPluginStatus()]);
 }
 
 function setUpdateDownloadSource(value: unknown) {
@@ -663,7 +657,7 @@ async function openOfflineExportDialog() {
   }
 }
 
-async function exportOfflinePackage(driverKeys: string[]) {
+async function exportOfflinePackage(driverKeys: string[], includeJres = true) {
   if (isWeb || agentExportImportBlocked.value || driverKeys.length === 0) return;
   const platform = offlineExportPreview.value?.platform ?? "current-platform";
   await runAgentOfflineExportAction({
@@ -679,6 +673,7 @@ async function exportOfflinePackage(driverKeys: string[]) {
         filters: [{ name: "ZIP", extensions: ["zip"] }],
       });
     },
+    includeJres,
     exportPackage: api.exportAgentsOffline,
     onSuccess: ({ destination, result }) => {
       offlineExportDialogOpen.value = false;
@@ -1460,6 +1455,7 @@ async function deleteJdbcLocalBundle(bundleId: string) {
 // ──────────── Lifecycle ────────────
 
 onMounted(async () => {
+  window.addEventListener(COMPONENT_DRIVER_UPDATES_CHANGED_EVENT, handleComponentDriverUpdatesChanged);
   updateAgentDrivers(await api.listInstalledAgentsLocal());
   void loadJavaRuntimeConfig();
   void loadDriverStoreUsage();
@@ -1507,6 +1503,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  window.removeEventListener(COMPONENT_DRIVER_UPDATES_CHANGED_EVENT, handleComponentDriverUpdatesChanged);
   unlisten?.();
   stopDriverRuntimePolling();
 });

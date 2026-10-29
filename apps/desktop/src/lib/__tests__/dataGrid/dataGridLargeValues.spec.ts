@@ -48,9 +48,48 @@ describe("data grid large-value metadata", () => {
       columnTypes: ["bigint", "longtext"],
       largeValuePreviewSize: TABLE_DATA_CELL_PREVIEW_SIZE,
     });
+    expect(tableDataLargeValuePreviewOptions("db2", [columns[0]!, column("payload", "blob")], ["id"], 100)).toEqual({
+      columnTypes: ["bigint", "blob"],
+      largeValuePreviewSize: TABLE_DATA_CELL_PREVIEW_SIZE,
+    });
     expect(tableDataLargeValuePreviewOptions("sqlite", columns, ["id"], 100)).toEqual({});
     expect(tableDataLargeValuePreviewOptions("mysql", columns, [], 100)).toEqual({});
     expect(tableDataLargeValuePreviewOptions("mysql", [columns[0]!], ["id"], 100)).toEqual({});
+  });
+
+  it("enables oracle previews for LOB columns and budgets over the LOB count only", () => {
+    const lobColumns = [column("ID", "NUMBER", true), column("REQ_PAYLOAD", "CLOB"), column("RAW_DATA", "BLOB")];
+    expect(canUseTableDataLargeValuePreview("oracle", lobColumns, ["ID"])).toBe(true);
+    expect(tableDataLargeValuePreviewOptions("oracle", lobColumns, ["ID"], 1000)).toEqual({
+      columnTypes: ["NUMBER", "CLOB", "BLOB"],
+      // 24 MiB / 1000 rows / 2 LOB columns / 6 serialized bytes per character.
+      largeValuePreviewSize: 2097,
+    });
+
+    // 宽表只按 LOB 列摊预算：30 个标量列不影响每个 LOB 单元格的预览大小
+    // （单 LOB 列 → 24 MiB / 1000 行 / 6 序列化字节 = 4194 字符）。
+    const wideColumns = [column("ID", "NUMBER", true), ...Array.from({ length: 30 }, (_, index) => column(`SCALAR_${index}`, "VARCHAR2")), column("BODY", "NCLOB")];
+    expect(tableDataLargeValuePreviewOptions("oracle", wideColumns, ["ID"], 1000)).toEqual({
+      columnTypes: wideColumns.map((item) => item.data_type),
+      largeValuePreviewSize: 4194,
+    });
+  });
+
+  it("keeps oracle previews off for tables without truncatable LOB columns", () => {
+    expect(canUseTableDataLargeValuePreview("oracle", [column("ID", "NUMBER", true), column("DOC", "XMLTYPE")], ["ID"])).toBe(false);
+    expect(canUseTableDataLargeValuePreview("oracle", [column("ID", "NUMBER", true), column("BODY", "CLOB")], [])).toBe(false);
+    expect(tableDataLargeValuePreviewOptions("oracle", [column("ID", "NUMBER", true), column("DOC", "XMLTYPE")], ["ID"], 100)).toEqual({});
+  });
+
+  it("keeps JDBC CLOB/BLOB locators intact while retaining the NCLOB SQL preview", () => {
+    const columns = [column("ID", "NUMBER", true), column("BODY", "CLOB"), column("DATA", "BLOB")];
+    expect(tableDataLargeValuePreviewOptions("oracle", columns, ["ID"], 1000, true)).toEqual({});
+    expect(tableDataLargeValuePreviewOptions("oracle", [...columns, column("NATIONAL", "NCLOB")], ["ID"], 1000, true)).toEqual({
+      columnTypes: ["NUMBER", "", "", "NCLOB"],
+      largeValuePreviewSize: 4194,
+    });
+    expect(columns.map((item) => item.data_type)).toEqual(["NUMBER", "CLOB", "BLOB"]);
+    expect(tableDataLargeValuePreviewOptions("oracle", columns, ["ID"], 1000)).toEqual({ columnTypes: ["NUMBER", "CLOB", "BLOB"], largeValuePreviewSize: 2097 });
   });
 
   it("disables marker parsing when a real column uses the reserved preview prefix", () => {
@@ -124,6 +163,8 @@ describe("data grid large-value metadata", () => {
     expect(isTableDataVisiblePreviewColumn("postgres", "jsonb")).toBe(true);
     expect(isTableDataVisiblePreviewColumn("postgres", "text[]")).toBe(false);
     expect(isTableDataVisiblePreviewColumn("postgres", "vector(1536)")).toBe(false);
+    expect(isTableDataVisiblePreviewColumn("db2", "clob")).toBe(true);
+    expect(isTableDataVisiblePreviewColumn("db2", "blob")).toBe(false);
     expect(isTableDataVisiblePreviewColumn("oracle", "clob")).toBe(false);
   });
 

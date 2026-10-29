@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 import az from "../locales/az";
 import en from "../locales/en";
 import es from "../locales/es";
+import id from "../locales/id";
 import it_ from "../locales/it";
 import ja from "../locales/ja";
 import ko from "../locales/ko";
 import ptBR from "../locales/pt-BR";
 import ru from "../locales/ru";
 import tr from "../locales/tr";
+import th from "../locales/th";
 import zhCN from "../locales/zh-CN";
 import zhTW from "../locales/zh-TW";
 
@@ -20,12 +22,14 @@ const locales: Array<[string, Record<string, unknown>]> = [
   ["en", en as Record<string, unknown>],
   ["az", az as Record<string, unknown>],
   ["es", es],
+  ["id", id],
   ["it", it_],
   ["ja", ja],
   ["ko", ko],
   ["pt-BR", ptBR],
   ["ru", ru],
   ["tr", tr],
+  ["th", th],
   ["zh-CN", zhCN],
   ["zh-TW", zhTW],
 ];

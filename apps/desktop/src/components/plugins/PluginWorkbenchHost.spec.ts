@@ -10,15 +10,16 @@ const mocks = vi.hoisted(() => ({
   subscribePluginEvents: vi.fn(),
   repushPluginConnection: vi.fn(),
   reopenPluginConnection: vi.fn(),
-  openPluginLocalFile: vi.fn(),
+  openDroppedPluginLocalFiles: vi.fn(),
   readPluginLocalFileChunk: vi.fn(),
   writePluginLocalFileChunk: vi.fn(),
   closePluginLocalFile: vi.fn(),
   openPluginWorkbench: vi.fn(),
+  isTauriRuntime: vi.fn(),
 }));
 
 vi.mock("@/lib/backend/tauri", () => ({
-  openPluginLocalFile: mocks.openPluginLocalFile,
+  openDroppedPluginLocalFiles: mocks.openDroppedPluginLocalFiles,
   readPluginLocalFileChunk: mocks.readPluginLocalFileChunk,
   writePluginLocalFileChunk: mocks.writePluginLocalFileChunk,
   closePluginLocalFile: mocks.closePluginLocalFile,
@@ -32,7 +33,7 @@ vi.mock("@/lib/backend/api", () => ({
   readPluginUiAsset: mocks.readPluginUiAsset,
   subscribePluginEvents: mocks.subscribePluginEvents,
 }));
-vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: mocks.isTauriRuntime }));
 vi.mock("@/lib/common/clipboard", () => ({ copyToClipboard: vi.fn() }));
 vi.mock("@/composables/useTheme", () => ({ useTheme: () => ({ isDark: ref(false), themeRevision: ref(0) }) }));
 vi.mock("@/stores/settingsStore", () => ({ useSettingsStore: () => ({ editorSettings: { uiFontFamily: "", fontFamily: "", fontSize: 14 } }) }));
@@ -40,11 +41,22 @@ vi.mock("@/stores/connectionStore", () => ({
   useConnectionStore: () => ({
     repushPluginConnection: mocks.repushPluginConnection,
     reopenPluginConnection: mocks.reopenPluginConnection,
+    connections: [
+      { id: "conn-mysql", name: "Prod MySQL", db_type: "mysql", plugin_connection_provider: undefined, plugin_connection_type: undefined, read_only: false },
+      { id: "conn-sample", name: "Sample Connection", db_type: "plugin", plugin_connection_provider: "sample.provider", plugin_connection_type: "sample", read_only: true },
+    ],
+    connectedIds: new Set(["conn-mysql"]),
   }),
 }));
-vi.mock("@/stores/queryStore", () => ({ useQueryStore: () => ({ openPluginWorkbench: mocks.openPluginWorkbench }) }));
+vi.mock("@/stores/queryStore", () => ({
+  useQueryStore: () => ({
+    openPluginWorkbench: mocks.openPluginWorkbench,
+    pluginWorkbenchTitles: vi.fn((_id: string) => ["Terminal 1"]),
+  }),
+}));
 vi.mock("vue-i18n", () => ({ useI18n: () => ({ locale: ref("en"), t: (key: string) => key }) }));
 
+import { clearPluginUiHtmlCache } from "@/lib/plugins/pluginUiHtmlCache";
 import PluginWorkbenchHost from "./PluginWorkbenchHost.vue";
 
 const plugin: InstalledPlugin = {
@@ -72,11 +84,18 @@ describe("PluginWorkbenchHost initialization", () => {
   let root: HTMLDivElement;
 
   beforeEach(() => {
+    clearPluginUiHtmlCache();
     vi.clearAllMocks();
+    mocks.isTauriRuntime.mockReturnValue(false);
+    const settings = (window as unknown as { happyDOM: { settings: Record<string, boolean> } }).happyDOM.settings;
+    settings.disableJavaScriptFileLoading = true;
+    settings.disableCSSFileLoading = true;
+    settings.handleDisabledFileLoadingAsSuccess = true;
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
     vi.stubGlobal("getComputedStyle", () => Object.assign([], { getPropertyValue: () => "" }));
     mocks.readPluginUiEntry.mockResolvedValue({ dataBase64: btoa("<!doctype html><html><body></body></html>"), contentType: "text/html" });
     mocks.subscribePluginEvents.mockResolvedValue(vi.fn());
+    mocks.closePluginLocalFile.mockResolvedValue(undefined);
     mocks.repushPluginConnection.mockReset().mockResolvedValue(undefined);
     mocks.reopenPluginConnection.mockResolvedValue(undefined);
     root = document.createElement("div");
@@ -105,6 +124,23 @@ describe("PluginWorkbenchHost initialization", () => {
     postMessage.mockClear();
     return { frame: frame!, postMessage, ready };
   }
+
+  it("passes the packaged module URL and existing asset CSP into srcdoc", async () => {
+    mocks.isTauriRuntime.mockReturnValue(true);
+    vi.stubEnv("PROD", true);
+    vi.stubGlobal("location", { protocol: "tauri:" });
+    mocks.readPluginUiEntry.mockResolvedValue({
+      dataBase64: btoa('<!doctype html><html><head></head><body><script type="module" src="./entry/app.mjs"></script></body></html>'),
+      contentType: "text/html",
+    });
+
+    const { frame } = await mountHost();
+    const srcdoc = frame.getAttribute("srcdoc") ?? "";
+    expect(srcdoc).toContain('<script type="module" src="dbx-plugin://localhost/sample/entry/app.mjs"></script>');
+    expect(srcdoc).toContain('<base href="dbx-plugin://localhost/sample/entry/">');
+    expect(srcdoc).toContain("script-src 'unsafe-inline' blob: dbx-plugin:;");
+    expect(mocks.readPluginUiAsset).not.toHaveBeenCalled();
+  });
 
   it("runs reinit before one init when load precedes ready", async () => {
     const firstReinit = deferred();
@@ -150,7 +186,7 @@ describe("PluginWorkbenchHost initialization", () => {
     const { frame, postMessage } = await mountHost();
     const elementFromPoint = vi.spyOn(document, "elementFromPoint").mockReturnValue(frame);
     // The Rust registry hands out uuid strings; the `t` prefix stays opaque.
-    mocks.openPluginLocalFile.mockResolvedValue({ handleId: "0d9f6d26-9e0e-4b1f-8f9a-2b6d3c5a7e81", name: "a.txt", size: 3, contentType: "text/plain", write: false });
+    mocks.openDroppedPluginLocalFiles.mockResolvedValue({ dropId: "drop-0001", truncated: false, files: [{ handleId: "0d9f6d26-9e0e-4b1f-8f9a-2b6d3c5a7e81", name: "a.txt", size: 3, contentType: "text/plain", write: false }] });
 
     const claimed = !document.dispatchEvent(
       new CustomEvent("dbx:tauri-file-drop", {
@@ -164,7 +200,102 @@ describe("PluginWorkbenchHost initialization", () => {
       const posted = postMessage.mock.calls.map(([message]) => message as Record<string, unknown>);
       expect(posted.some((message) => message.type === "filedrop" && (message.files as Array<Record<string, unknown>>)?.some((file) => file.handleId === "t0d9f6d26-9e0e-4b1f-8f9a-2b6d3c5a7e81" && file.name === "a.txt"))).toBe(true);
     });
-    expect(mocks.openPluginLocalFile).toHaveBeenCalledWith("sample", "/tmp/a.txt", false);
+    expect(mocks.openDroppedPluginLocalFiles).toHaveBeenCalledWith("sample", ["/tmp/a.txt"]);
+    elementFromPoint.mockRestore();
+  });
+
+  it("forwards a dropped folder as the files the Rust side expanded it to", async () => {
+    const { frame, postMessage } = await mountHost();
+    const elementFromPoint = vi.spyOn(document, "elementFromPoint").mockReturnValue(frame);
+    mocks.openDroppedPluginLocalFiles.mockResolvedValue({
+      dropId: "drop-0002",
+      truncated: true,
+      files: [
+        { handleId: "0d9f6d26-9e0e-4b1f-8f9a-2b6d3c5a7e81", name: "a.txt", size: 1, contentType: "text/plain", write: false, relativePath: "folder/a.txt" },
+        { handleId: "1d9f6d26-9e0e-4b1f-8f9a-2b6d3c5a7e81", name: "nested.csv", size: 2, contentType: "text/csv", write: false, relativePath: "folder/nested/nested.csv" },
+      ],
+    });
+
+    document.dispatchEvent(
+      new CustomEvent("dbx:tauri-file-drop", {
+        detail: { type: "drop", paths: ["/tmp/folder"], position: { x: 200, y: 200 } },
+        cancelable: true,
+      }),
+    );
+
+    await vi.waitFor(() => {
+      const posted = postMessage.mock.calls.map(([message]) => message as Record<string, unknown>);
+      const filedrop = posted.find((message) => message.type === "filedrop");
+      expect((filedrop?.files as Array<Record<string, unknown>>)?.map((file) => file.relativePath)).toEqual(["folder/a.txt", "folder/nested/nested.csv"]);
+      expect(filedrop?.dropId).toBe("drop-0002");
+      expect(filedrop?.truncated).toBe(true);
+    });
+    expect(mocks.openDroppedPluginLocalFiles).toHaveBeenCalledWith("sample", ["/tmp/folder"]);
+    elementFromPoint.mockRestore();
+  });
+
+  it("does not forward a filedrop when no dropped path could be opened", async () => {
+    const { frame, postMessage } = await mountHost();
+    const elementFromPoint = vi.spyOn(document, "elementFromPoint").mockReturnValue(frame);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.openDroppedPluginLocalFiles.mockResolvedValue({ dropId: "drop-0003", truncated: false, files: [] });
+
+    const claimed = !document.dispatchEvent(
+      new CustomEvent("dbx:tauri-file-drop", {
+        detail: { type: "drop", paths: ["/tmp/gone"], position: { x: 200, y: 200 } },
+        cancelable: true,
+      }),
+    );
+
+    expect(claimed).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(postMessage.mock.calls.some(([message]) => (message as Record<string, unknown>).type === "filedrop")).toBe(false);
+    expect(consoleError).toHaveBeenCalled();
+    consoleError.mockRestore();
+    elementFromPoint.mockRestore();
+  });
+
+  it("sweeps opened drop entries when the workbench unmounts", async () => {
+    const { frame, postMessage } = await mountHost();
+    const elementFromPoint = vi.spyOn(document, "elementFromPoint").mockReturnValue(frame);
+    mocks.openDroppedPluginLocalFiles.mockResolvedValue({ dropId: "drop-0004", truncated: false, files: [{ handleId: "0d9f6d26-9e0e-4b1f-8f9a-2b6d3c5a7e81", name: "a.txt", size: 1, contentType: "text/plain", write: false }] });
+    document.dispatchEvent(
+      new CustomEvent("dbx:tauri-file-drop", {
+        detail: { type: "drop", paths: ["/tmp/a.txt"], position: { x: 200, y: 200 } },
+        cancelable: true,
+      }),
+    );
+    await vi.waitFor(() => expect(postMessage.mock.calls.some(([message]) => (message as Record<string, unknown>).type === "filedrop")).toBe(true));
+
+    app?.unmount();
+    app = undefined;
+    // Teardown closes exactly the handles this instance opened — never an
+    // owner-wide sweep, which would kill a sibling workbench's handles.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.closePluginLocalFile).toHaveBeenCalledWith("sample", "0d9f6d26-9e0e-4b1f-8f9a-2b6d3c5a7e81");
+    elementFromPoint.mockRestore();
+  });
+
+  it("retires an in-flight drop whose expansion lands after unmount", async () => {
+    const { frame, postMessage } = await mountHost();
+    const elementFromPoint = vi.spyOn(document, "elementFromPoint").mockReturnValue(frame);
+    let resolveOpen!: (result: unknown) => void;
+    mocks.openDroppedPluginLocalFiles.mockReturnValue(new Promise((resolve) => (resolveOpen = resolve)));
+
+    document.dispatchEvent(
+      new CustomEvent("dbx:tauri-file-drop", {
+        detail: { type: "drop", paths: ["/tmp/folder"], position: { x: 200, y: 200 } },
+        cancelable: true,
+      }),
+    );
+    // The expansion is still in flight when the workbench tears down.
+    app?.unmount();
+    app = undefined;
+    resolveOpen({ dropId: "drop-late", truncated: false, files: [{ handleId: "0d9f6d26-9e0e-4b1f-8f9a-2b6d3c5a7e81", name: "late.txt", size: 1, contentType: "text/plain", write: false }] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(mocks.closePluginLocalFile).toHaveBeenCalledWith("sample", "0d9f6d26-9e0e-4b1f-8f9a-2b6d3c5a7e81");
+    expect(postMessage.mock.calls.some(([message]) => (message as Record<string, unknown>).type === "filedrop")).toBe(false);
     elementFromPoint.mockRestore();
   });
 
@@ -182,7 +313,7 @@ describe("PluginWorkbenchHost initialization", () => {
     expect(claimed).toBe(false);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(postMessage).not.toHaveBeenCalled();
-    expect(mocks.openPluginLocalFile).not.toHaveBeenCalled();
+    expect(mocks.openDroppedPluginLocalFiles).not.toHaveBeenCalled();
     elementFromPoint.mockRestore();
   });
 
@@ -197,5 +328,158 @@ describe("PluginWorkbenchHost initialization", () => {
     document.dispatchEvent(payload("leave"));
     expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "dragstate", active: false }), "*");
     elementFromPoint.mockRestore();
+  });
+
+  it("converts physical window coordinates to iframe CSS coordinates and throttles sub-pixel moves", async () => {
+    const { frame, postMessage } = await mountHost();
+    const elementFromPoint = vi.spyOn(document, "elementFromPoint").mockReturnValue(frame);
+    const getBoundingClientRect = vi.spyOn(frame, "getBoundingClientRect").mockReturnValue({
+      left: 20,
+      top: 30,
+      right: 320,
+      bottom: 230,
+      width: 300,
+      height: 200,
+      x: 20,
+      y: 30,
+      toJSON: () => ({}),
+    });
+    const originalDpr = window.devicePixelRatio;
+    Object.defineProperty(window, "devicePixelRatio", { value: 2, configurable: true });
+
+    try {
+      // 1. Enter at physical (100, 120) -> CSS (50, 60) -> relative (30, 30)
+      document.dispatchEvent(
+        new CustomEvent("dbx:tauri-file-drop", {
+          detail: { type: "enter", position: { x: 100, y: 120 } },
+          cancelable: true,
+        }),
+      );
+      expect(postMessage).toHaveBeenLastCalledWith(expect.objectContaining({ type: "dragstate", active: true, position: { x: 30, y: 30 } }), "*");
+
+      postMessage.mockClear();
+
+      // 2. Over with sub-pixel move: physical (101, 120) -> CSS (50.5, 60) -> relative (30.5, 30) -> deltaX = 0.5 < 1px
+      document.dispatchEvent(
+        new CustomEvent("dbx:tauri-file-drop", {
+          detail: { type: "over", position: { x: 101, y: 120 } },
+          cancelable: true,
+        }),
+      );
+      expect(postMessage).not.toHaveBeenCalled();
+
+      // 3. Over with >= 1px move: physical (110, 120) -> CSS (55, 60) -> relative (35, 30) -> deltaX = 5 >= 1px
+      document.dispatchEvent(
+        new CustomEvent("dbx:tauri-file-drop", {
+          detail: { type: "over", position: { x: 110, y: 120 } },
+          cancelable: true,
+        }),
+      );
+      expect(postMessage).toHaveBeenLastCalledWith(expect.objectContaining({ type: "dragstate", active: true, position: { x: 35, y: 30 } }), "*");
+
+      postMessage.mockClear();
+
+      // 4. Drop at physical (120, 140) -> CSS (60, 70) -> relative (40, 40)
+      mocks.openDroppedPluginLocalFiles.mockResolvedValueOnce({
+        dropId: "drop-coord-test",
+        truncated: false,
+        files: [{ handleId: "h-coord", name: "b.txt", size: 5, contentType: "text/plain", write: false }],
+      });
+      document.dispatchEvent(
+        new CustomEvent("dbx:tauri-file-drop", {
+          detail: { type: "drop", paths: ["/tmp/b.txt"], position: { x: 120, y: 140 } },
+          cancelable: true,
+        }),
+      );
+
+      await vi.waitFor(() => {
+        expect(postMessage).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "filedrop",
+            position: { x: 40, y: 40 },
+            dropId: "drop-coord-test",
+          }),
+          "*",
+        );
+      });
+      expect(postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "dragstate",
+          active: false,
+        }),
+        "*",
+      );
+    } finally {
+      Object.defineProperty(window, "devicePixelRatio", { value: originalDpr, configurable: true });
+      getBoundingClientRect.mockRestore();
+      elementFromPoint.mockRestore();
+    }
+  });
+
+  it("serves all connections with connected status when plugin has host.connections:read", async () => {
+    const pluginWithPerm: InstalledPlugin = {
+      manifest: { id: "sample", name: "Sample", version: "1.0.0", permissions: ["host.connections:read"], drivers: [], contributions: [] },
+      compatibility: { compatible: true },
+    };
+    app = createApp(PluginWorkbenchHost, { plugin: pluginWithPerm, contribution, context: { connectionId: "connection" } });
+    app.mount(root);
+    await flushWorkbenchLoad();
+    const frame = root.querySelector("iframe")!;
+    const target = frame.contentWindow!;
+    const postMessage = vi.spyOn(target, "postMessage").mockImplementation(() => {});
+    window.dispatchEvent(new MessageEvent("message", { source: target, data: { source: "dbx-plugin", version: 1, type: "ready" } }));
+    await vi.waitFor(() => expect(mocks.repushPluginConnection).toHaveBeenCalled());
+    postMessage.mockClear();
+
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        source: target,
+        data: { source: "dbx-plugin", version: 1, type: "request", id: "conn-req-1", method: "host.getConnections", params: {} },
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          source: "dbx-host",
+          type: "response",
+          id: "conn-req-1",
+          result: expect.arrayContaining([expect.objectContaining({ id: "conn-mysql", name: "Prod MySQL", dbType: "mysql", dialect: "mysql", connected: true, isConnected: true }), expect.objectContaining({ id: "conn-sample", name: "Sample Connection", connected: false, isConnected: false })]),
+        }),
+        "*",
+      ),
+    );
+  });
+
+  it("posts a layout message to the iframe when active becomes true", async () => {
+    const activeRef = ref(false);
+    app = createApp({
+      components: { PluginWorkbenchHost },
+      setup() {
+        return { activeRef, plugin, contribution };
+      },
+      template: '<PluginWorkbenchHost :plugin="plugin" :contribution="contribution" :active="activeRef" />',
+    });
+    app.mount(root);
+    await flushWorkbenchLoad();
+
+    const frame = root.querySelector("iframe")!;
+    const target = frame.contentWindow!;
+    const postMessage = vi.spyOn(target, "postMessage").mockImplementation(() => {});
+
+    // Initially inactive: no layout message
+    expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "layout" }), "*");
+
+    // Transition to active
+    activeRef.value = true;
+    await nextTick();
+    await vi.waitFor(() =>
+      expect(postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          source: "dbx-host",
+          type: "layout",
+        }),
+        "*",
+      ),
+    );
   });
 });

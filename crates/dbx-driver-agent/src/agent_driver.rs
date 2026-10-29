@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,8 +15,45 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_manager::AGENT_JAVA_TOO_OLD_MESSAGE;
 use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
 use crate::models::connection::DatabaseConnectionInfo;
+use crate::startup_cleanup::{StartupChildExit, StartupCleanupGuard};
 
 type PendingAgentResponse = tokio::sync::oneshot::Sender<Result<Value, String>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeCallPolicy {
+    CancelSession,
+    PlDebug,
+}
+
+const PL_DEBUG_REQUEST_QUEUED: u8 = 0;
+const PL_DEBUG_REQUEST_SENDING: u8 = 1;
+const PL_DEBUG_REQUEST_ABANDONED: u8 = 2;
+const PL_DEBUG_MAX_IN_FLIGHT: usize = 8;
+
+struct PlDebugRequestGuard {
+    id: u64,
+    pending: Arc<Mutex<HashMap<u64, PendingAgentResponse>>>,
+    dispatch: Arc<AtomicU8>,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl PlDebugRequestGuard {
+    fn abandon(&self) -> AgentOperationOutcome {
+        match self.dispatch.swap(PL_DEBUG_REQUEST_ABANDONED, Ordering::AcqRel) {
+            PL_DEBUG_REQUEST_QUEUED => AgentOperationOutcome::NotStarted,
+            _ => AgentOperationOutcome::Unknown,
+        }
+    }
+}
+
+impl Drop for PlDebugRequestGuard {
+    fn drop(&mut self) {
+        self.abandon();
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.id);
+        }
+    }
+}
 
 #[derive(Clone)]
 struct CachedAgentQuery {
@@ -29,6 +66,7 @@ pub struct AgentRuntimeClient {
     child: Arc<Mutex<Child>>,
     child_reaper_started: Arc<AtomicBool>,
     child_reaped: Arc<AtomicBool>,
+    startup_exit: Option<StartupChildExit>,
     stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
     pending: Arc<Mutex<HashMap<u64, PendingAgentResponse>>>,
     stderr_tail: Arc<Mutex<StderrTail>>,
@@ -36,55 +74,72 @@ pub struct AgentRuntimeClient {
     active_sessions: AtomicU64,
     failed: Arc<AtomicBool>,
     handshake: AgentHandshake,
+    pl_debug_in_flight: Arc<tokio::sync::Semaphore>,
 }
 
 impl AgentRuntimeClient {
     pub async fn spawn(launch: AgentLaunchSpec, app_version: &str) -> Result<Arc<Self>, String> {
-        let mut child = spawn_agent_process(&launch)?;
-        let child_stdin = child.stdin.take().ok_or("Failed to capture agent stdin")?;
-        let child_stdout = child.stdout.take().ok_or("Failed to capture agent stdout")?;
-        let child_stderr = child.stderr.take().ok_or("Failed to capture agent stderr")?;
-        let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
-        start_stderr_collector(child_stderr, stderr_tail.clone());
+        Self::spawn_internal(launch, app_version, None, None).await
+    }
 
-        let mut stdout = BufReader::new(child_stdout);
-        let stdout = tokio::time::timeout(
-            Duration::from_secs(STARTUP_TIMEOUT_SECS),
-            tokio::task::spawn_blocking(move || loop {
-                let line = read_agent_line(&mut stdout, "startup line")?;
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Value>(trimmed) {
-                    Ok(value) if value.get("ready") == Some(&Value::Bool(true)) => return Ok(stdout),
-                    Ok(_) => return Err(format!("Agent did not send ready signal, got: {line}")),
-                    Err(_) => log::warn!("[agent:stdout] ignoring non-JSON line during startup: {trimmed}"),
-                }
-            }),
-        )
-        .await
-        .map_err(|_| format!("Agent startup timed out ({STARTUP_TIMEOUT_SECS}s)"))?
-        .map_err(|e| format!("Agent startup task failed: {e}"))??;
+    pub async fn spawn_before(
+        launch: AgentLaunchSpec,
+        app_version: &str,
+        deadline: Instant,
+    ) -> Result<Arc<Self>, String> {
+        Self::spawn_internal(launch, app_version, Some(deadline), None).await
+    }
+
+    pub(crate) async fn spawn_before_observed(
+        launch: AgentLaunchSpec,
+        app_version: &str,
+        deadline: Instant,
+        startup: &StartupCleanupGuard,
+    ) -> Result<Arc<Self>, String> {
+        Self::spawn_internal(launch, app_version, Some(deadline), Some(startup)).await
+    }
+
+    async fn spawn_internal(
+        launch: AgentLaunchSpec,
+        app_version: &str,
+        deadline: Option<Instant>,
+        startup: Option<&StartupCleanupGuard>,
+    ) -> Result<Arc<Self>, String> {
+        let ReadyAgentProcess { child, stdin, stdout, stderr_tail, startup_exit } = match deadline {
+            Some(deadline) => spawn_ready_agent_process_before(&launch, deadline, startup).await?,
+            None => spawn_ready_agent_process(&launch).await?,
+        };
 
         let runtime = Arc::new(Self {
             child: Arc::new(Mutex::new(child)),
             child_reaper_started: Arc::new(AtomicBool::new(false)),
             child_reaped: Arc::new(AtomicBool::new(false)),
-            stdin: Arc::new(Mutex::new(BufWriter::new(child_stdin))),
+            startup_exit,
+            stdin: Arc::new(Mutex::new(stdin)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             stderr_tail,
             next_id: AtomicU64::new(0),
             active_sessions: AtomicU64::new(0),
             failed: Arc::new(AtomicBool::new(false)),
-            handshake: AgentHandshake { protocol_version: 0, agent_protocol_version: 0, capabilities: Vec::new() },
+            handshake: AgentHandshake {
+                protocol_version: 0,
+                agent_protocol_version: 0,
+                capabilities: Vec::new(),
+                pl_debug: None,
+            },
+            pl_debug_in_flight: Arc::new(tokio::sync::Semaphore::new(PL_DEBUG_MAX_IN_FLIGHT)),
         });
+        let mut startup_guard = RuntimeStartupGuard(deadline.map(|_| runtime.clone()));
         runtime.start_response_reader(stdout);
+        let handshake_timeout = match deadline {
+            Some(deadline) => startup_remaining(deadline)?.min(Duration::from_secs(RPC_TIMEOUT_SECS)),
+            None => Duration::from_secs(RPC_TIMEOUT_SECS),
+        };
         let handshake = match runtime
             .call_typed::<AgentHandshake>(
                 AgentMethod::Handshake.as_str(),
                 agent_handshake_params(app_version),
-                Some(Duration::from_secs(RPC_TIMEOUT_SECS)),
+                Some(handshake_timeout),
                 None,
             )
             .await
@@ -103,8 +158,14 @@ impl AgentRuntimeClient {
             runtime.kill();
             return Err("Agent runtime does not support multi_session protocol v2".to_string());
         }
-        let runtime =
-            Arc::try_unwrap(runtime).map_err(|_| "Agent runtime initialization is still referenced".to_string())?;
+        if let Some(deadline) = deadline {
+            startup_remaining(deadline)?;
+        }
+        startup_guard.0.take();
+        let runtime = Arc::try_unwrap(runtime).map_err(|runtime| {
+            runtime.kill();
+            "Agent runtime initialization is still referenced".to_string()
+        })?;
         Ok(Arc::new(Self { handshake, ..runtime }))
     }
 
@@ -114,13 +175,14 @@ impl AgentRuntimeClient {
         let child = self.child.clone();
         let child_reaper_started = self.child_reaper_started.clone();
         let child_reaped = self.child_reaped.clone();
+        let startup_exit = self.startup_exit.clone();
         std::thread::spawn(move || loop {
             let response = match read_agent_json_response(&mut stdout) {
                 Ok((_, response)) => response,
                 Err(err) => {
                     failed.store(true, Ordering::Release);
                     fail_pending_requests(&pending, err);
-                    terminate_and_reap_shared_agent(child, child_reaper_started, child_reaped);
+                    terminate_and_reap_shared_agent(child, child_reaper_started, child_reaped, startup_exit);
                     return;
                 }
             };
@@ -152,9 +214,55 @@ impl AgentRuntimeClient {
         timeout_duration: Option<Duration>,
         cancel_token: Option<CancellationToken>,
     ) -> Result<T, AgentCallError> {
+        self.call_typed_with_policy(method, params, timeout_duration, cancel_token, RuntimeCallPolicy::CancelSession)
+            .await
+    }
+
+    pub(crate) async fn call_pl_debug_typed<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+        timeout_duration: Duration,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, AgentCallError> {
+        self.call_typed_with_policy(method, params, Some(timeout_duration), cancel_token, RuntimeCallPolicy::PlDebug)
+            .await
+    }
+
+    async fn call_typed_with_policy<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+        policy: RuntimeCallPolicy,
+    ) -> Result<T, AgentCallError> {
+        let started = Instant::now();
         if self.failed.load(Ordering::Acquire) {
             return Err(AgentCallError::Transport { message: "Agent runtime is unavailable".to_string() });
         }
+        let permit = if policy == RuntimeCallPolicy::PlDebug {
+            if cancel_token.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return Err(AgentCallError::Canceled {
+                    stage: agent_error_stage(method),
+                    operation_outcome: AgentOperationOutcome::NotStarted,
+                });
+            }
+            Some(Arc::new(self.pl_debug_in_flight.clone().try_acquire_owned().map_err(|_| AgentCallError::Legacy {
+                rpc_code: None,
+                message: "The debugger request channel is busy".to_string(),
+                hints: LegacyAgentHints {
+                    category: Some(AgentErrorCategory::Resource),
+                    retryable: Some(false),
+                    session_disposition: Some(AgentSessionDisposition::Keep),
+                    stage: Some(AgentErrorStage::Request),
+                    operation_outcome: Some(AgentOperationOutcome::NotStarted),
+                    agent_session_id: params.get("agentSessionId").and_then(Value::as_str).map(str::to_owned),
+                },
+            })?))
+        } else {
+            None
+        };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let request = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let request_line = serde_json::to_string(&request)
@@ -164,41 +272,99 @@ impl AgentRuntimeClient {
             .lock()
             .map_err(|_| AgentCallError::Transport { message: "Agent pending response lock poisoned".to_string() })?
             .insert(id, sender);
-        let write_result =
-            self.stdin.lock().map_err(|_| "Agent stdin lock poisoned".to_string()).and_then(|mut writer| {
-                writer
-                    .write_all(request_line.as_bytes())
-                    .and_then(|_| writer.write_all(b"\n"))
-                    .and_then(|_| writer.flush())
-                    .map_err(|e| format!("Failed to write agent request: {e}"))
-            });
-        if let Err(err) = write_result {
-            self.pending.lock().expect("agent pending response lock poisoned").remove(&id);
-            return Err(AgentCallError::Transport { message: err });
-        }
+        let pl_request = permit.map(|permit| PlDebugRequestGuard {
+            id,
+            pending: self.pending.clone(),
+            dispatch: Arc::new(AtomicU8::new(PL_DEBUG_REQUEST_QUEUED)),
+            permit,
+        });
+        let write_task = if let Some(request) = &pl_request {
+            let stdin = self.stdin.clone();
+            let dispatch = request.dispatch.clone();
+            let permit = request.permit.clone();
+            let token = cancel_token.clone();
+            let deadline = timeout_duration.map(|duration| started + duration);
+            let stage = agent_error_stage(method);
+            Some(tokio::task::spawn_blocking(move || {
+                // A timed-out write still owns its capacity until the actual writer
+                // returns. Queued requests may not start sending after abandonment.
+                let _permit = permit;
+                let mut writer = stdin
+                    .lock()
+                    .map_err(|_| AgentCallError::Transport { message: "Agent stdin lock poisoned".to_string() })?;
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(AgentCallError::Timeout {
+                        stage,
+                        operation_outcome: AgentOperationOutcome::NotStarted,
+                    });
+                }
+                if token.as_ref().is_some_and(CancellationToken::is_cancelled)
+                    || dispatch
+                        .compare_exchange(
+                            PL_DEBUG_REQUEST_QUEUED,
+                            PL_DEBUG_REQUEST_SENDING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                {
+                    return Err(AgentCallError::Canceled {
+                        stage,
+                        operation_outcome: AgentOperationOutcome::NotStarted,
+                    });
+                }
+                write_runtime_request(&mut writer, &request_line)
+                    .map_err(|message| AgentCallError::Transport { message })
+            }))
+        } else {
+            let write_result = self
+                .stdin
+                .lock()
+                .map_err(|_| "Agent stdin lock poisoned".to_string())
+                .and_then(|mut writer| write_runtime_request(&mut writer, &request_line));
+            if let Err(err) = write_result {
+                self.pending.lock().expect("agent pending response lock poisoned").remove(&id);
+                return Err(AgentCallError::Transport { message: err });
+            }
+            None
+        };
 
         let receive = async {
+            if let Some(write_task) = write_task {
+                write_task.await.map_err(|error| AgentCallError::Transport {
+                    message: format!("Agent write task failed: {error}"),
+                })??;
+            }
             receiver
                 .await
                 .map_err(|_| AgentCallError::Transport { message: "Agent response channel closed".to_string() })?
                 .map_err(|message| AgentCallError::Transport { message })
         };
+        let timeout_duration = if policy == RuntimeCallPolicy::PlDebug {
+            timeout_duration.map(|duration| duration.saturating_sub(started.elapsed()))
+        } else {
+            timeout_duration
+        };
+        let wait_outcome =
+            || pl_request.as_ref().map(PlDebugRequestGuard::abandon).unwrap_or_else(|| agent_operation_outcome(method));
         let response = match (timeout_duration, cancel_token) {
             (Some(duration), Some(token)) => tokio::select! {
                 _ = token.cancelled() => {
-                    self.cancel_session_request_for_method(method, &params).await;
+                    let operation_outcome = wait_outcome();
+                    self.cancel_session_request_for_method(method, &params, policy).await;
                     Err(AgentCallError::Canceled {
                         stage: agent_error_stage(method),
-                        operation_outcome: agent_operation_outcome(method),
+                        operation_outcome,
                     })
                 },
                 result = tokio::time::timeout(duration, receive) => match result {
                     Ok(result) => result,
                     Err(_) => {
-                        self.cancel_session_request_for_method(method, &params).await;
+                        let operation_outcome = wait_outcome();
+                        self.cancel_session_request_for_method(method, &params, policy).await;
                         Err(AgentCallError::Timeout {
                             stage: agent_error_stage(method),
-                            operation_outcome: agent_operation_outcome(method),
+                            operation_outcome,
                         })
                     }
                 },
@@ -206,19 +372,18 @@ impl AgentRuntimeClient {
             (Some(duration), None) => match tokio::time::timeout(duration, receive).await {
                 Ok(result) => result,
                 Err(_) => {
-                    self.cancel_session_request_for_method(method, &params).await;
-                    Err(AgentCallError::Timeout {
-                        stage: agent_error_stage(method),
-                        operation_outcome: agent_operation_outcome(method),
-                    })
+                    let operation_outcome = wait_outcome();
+                    self.cancel_session_request_for_method(method, &params, policy).await;
+                    Err(AgentCallError::Timeout { stage: agent_error_stage(method), operation_outcome })
                 }
             },
             (None, Some(token)) => tokio::select! {
                 _ = token.cancelled() => {
-                    self.cancel_session_request_for_method(method, &params).await;
+                    let operation_outcome = wait_outcome();
+                    self.cancel_session_request_for_method(method, &params, policy).await;
                     Err(AgentCallError::Canceled {
                         stage: agent_error_stage(method),
-                        operation_outcome: agent_operation_outcome(method),
+                        operation_outcome,
                     })
                 },
                 result = receive => result,
@@ -229,6 +394,15 @@ impl AgentRuntimeClient {
             self.pending.lock().expect("agent pending response lock poisoned").remove(&id);
         }
         let response = response?;
+        if policy == RuntimeCallPolicy::PlDebug && method.starts_with("pl_debug_") {
+            if let Some(error) = response.get("error") {
+                return Err(parse_pl_debug_call_error(
+                    error,
+                    self.handshake.supports(AgentCapability::StructuredErrorV1),
+                    params.get("agentSessionId").and_then(Value::as_str),
+                ));
+            }
+        }
         decode_agent_response(
             response,
             self.handshake.supports(AgentCapability::StructuredErrorV1),
@@ -236,8 +410,8 @@ impl AgentRuntimeClient {
         )
     }
 
-    async fn cancel_session_request_for_method(&self, method: &str, params: &Value) {
-        if method != AgentMethod::CancelSession.as_str() {
+    async fn cancel_session_request_for_method(&self, method: &str, params: &Value, policy: RuntimeCallPolicy) {
+        if policy == RuntimeCallPolicy::CancelSession && method != AgentMethod::CancelSession.as_str() {
             self.cancel_session_request(params).await;
         }
     }
@@ -294,8 +468,37 @@ impl AgentRuntimeClient {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
         }
-        start_shared_agent_reaper(self.child.clone(), self.child_reaper_started.clone(), self.child_reaped.clone());
+        start_shared_agent_reaper(
+            self.child.clone(),
+            self.child_reaper_started.clone(),
+            self.child_reaped.clone(),
+            self.startup_exit.clone(),
+        );
         fail_pending_requests(&self.pending, "Agent runtime terminated".to_string());
+    }
+
+    /// Observe a graceful exit without holding the child lock across a wait;
+    /// a dedicated-runtime watchdog must remain able to kill the same child.
+    pub(crate) async fn wait_for_exit(&self, timeout_duration: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout_duration;
+        loop {
+            if self.startup_exit.as_ref().is_some_and(StartupChildExit::is_confirmed) {
+                return true;
+            }
+            if let Ok(mut child) = self.child.try_lock() {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    self.child_reaped.store(true, Ordering::Release);
+                    if let Some(exit) = &self.startup_exit {
+                        exit.wait_finished(true);
+                    }
+                    return true;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep_until((tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline)).await;
+        }
     }
 
     pub async fn kill_and_wait(&self) {
@@ -307,6 +510,7 @@ impl AgentRuntimeClient {
         }
         let child = self.child.clone();
         let child_reaped = self.child_reaped.clone();
+        let startup_exit = self.startup_exit.clone();
         let result = tokio::task::spawn_blocking(move || {
             let result =
                 child.lock().map_err(|_| "Shared agent process lock poisoned".to_string()).and_then(|mut child| {
@@ -314,6 +518,9 @@ impl AgentRuntimeClient {
                     child.wait().map(|_| ()).map_err(|err| format!("Failed to wait for shared agent runtime: {err}"))
                 });
             child_reaped.store(true, Ordering::Release);
+            if let Some(exit) = startup_exit {
+                exit.wait_finished(result.is_ok());
+            }
             result
         })
         .await;
@@ -325,21 +532,41 @@ impl AgentRuntimeClient {
     }
 }
 
+struct RuntimeStartupGuard(Option<Arc<AgentRuntimeClient>>);
+
+impl Drop for RuntimeStartupGuard {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.kill();
+        }
+    }
+}
+
+fn write_runtime_request(writer: &mut BufWriter<ChildStdin>, request_line: &str) -> Result<(), String> {
+    writer
+        .write_all(request_line.as_bytes())
+        .and_then(|_| writer.write_all(b"\n"))
+        .and_then(|_| writer.flush())
+        .map_err(|error| format!("Failed to write agent request: {error}"))
+}
+
 fn terminate_and_reap_shared_agent(
     child: Arc<Mutex<Child>>,
     child_reaper_started: Arc<AtomicBool>,
     child_reaped: Arc<AtomicBool>,
+    startup_exit: Option<StartupChildExit>,
 ) {
     if let Ok(mut child) = child.lock() {
         let _ = child.kill();
     }
-    start_shared_agent_reaper(child, child_reaper_started, child_reaped);
+    start_shared_agent_reaper(child, child_reaper_started, child_reaped, startup_exit);
 }
 
 fn start_shared_agent_reaper(
     child: Arc<Mutex<Child>>,
     child_reaper_started: Arc<AtomicBool>,
     child_reaped: Arc<AtomicBool>,
+    startup_exit: Option<StartupChildExit>,
 ) {
     if child_reaper_started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return;
@@ -350,6 +577,9 @@ fn start_shared_agent_reaper(
                 child.wait().map(|_| ()).map_err(|err| format!("Failed to wait for shared agent runtime: {err}"))
             });
         child_reaped.store(true, Ordering::Release);
+        if let Some(exit) = startup_exit {
+            exit.wait_finished(result.is_ok());
+        }
         match result {
             Ok(()) => {}
             Err(err) => log::warn!("{err}"),
@@ -687,6 +917,42 @@ fn parse_agent_call_error(
     }
 }
 
+fn parse_pl_debug_call_error(
+    error: &Value,
+    strict_structured_errors: bool,
+    expected_session_id: Option<&str>,
+) -> AgentCallError {
+    let classified = parse_agent_call_error(error, strict_structured_errors, expected_session_id);
+    // This Java/OB extension is scoped to the fixed debugger channel. Ordinary
+    // query recovery must keep rejecting resource/keep/unknown combinations.
+    if let AgentCallError::ContractViolation {
+        rpc_code,
+        message,
+        reason: ContractViolationReason::InvalidCombination,
+    } = &classified
+    {
+        if let Some(context) =
+            error.get("data").and_then(|data| serde_json::from_value::<AgentErrorContext>(data.clone()).ok())
+        {
+            if context.category == AgentErrorCategory::Resource
+                && !context.retryable
+                && context.session_disposition == AgentSessionDisposition::Keep
+                && context.stage == AgentErrorStage::Execute
+                && context.operation_outcome == AgentOperationOutcome::Unknown
+                && context.sql_state.as_deref() == Some("HY001")
+                && valid_agent_error_diagnostics(&context)
+            {
+                return AgentCallError::Structured {
+                    rpc_code: rpc_code.unwrap_or(-1),
+                    message: message.clone(),
+                    context,
+                };
+            }
+        }
+    }
+    classified
+}
+
 fn parse_structured_error_context(
     data: &Value,
     expected_session_id: Option<&str>,
@@ -767,6 +1033,10 @@ pub fn valid_agent_error_combination(context: &AgentErrorContext) -> bool {
     if !valid_disposition {
         return false;
     }
+    valid_agent_error_diagnostics(context)
+}
+
+fn valid_agent_error_diagnostics(context: &AgentErrorContext) -> bool {
     valid_ascii_diagnostic(context.sql_state.as_deref(), 16)
         && valid_ascii_diagnostic(context.exception_class.as_deref(), 160)
         && context.agent_session_id.as_deref().is_none_or(valid_ascii_identifier)
@@ -873,8 +1143,18 @@ const AGENT_STDOUT_NOISE_SAMPLE_CHARS: usize = 160;
 const MAX_AGENT_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
 const AGENT_EXIT_DIAGNOSTIC_WAIT_MS: u64 = 1_000;
 const AGENT_EXIT_DIAGNOSTIC_POLL_MS: u64 = 10;
+const AGENT_STARTUP_RETRY_DELAY_MS: u64 = 100;
 const SHARED_RUNTIME_IDLE_GRACE_SECS: u64 = 30;
 const AGENT_JAVA_OPTS_ENV: &str = "DBX_AGENT_JAVA_OPTS";
+
+fn agent_json_rpc_response_id(response: &Value) -> Option<u64> {
+    if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || (response.get("result").is_none() && response.get("error").is_none())
+    {
+        return None;
+    }
+    response.get("id").and_then(Value::as_u64)
+}
 
 pub struct AgentDriverClient {
     child: Option<Child>,
@@ -882,6 +1162,7 @@ pub struct AgentDriverClient {
     stdout: Option<BufReader<ChildStdout>>,
     stderr_tail: Arc<Mutex<StderrTail>>,
     handshake: Option<AgentHandshake>,
+    session_exact_metadata_identity: Option<bool>,
     next_id: u64,
     shared_runtime: Option<Arc<AgentRuntimeClient>>,
     agent_session_id: Option<String>,
@@ -889,6 +1170,7 @@ pub struct AgentDriverClient {
     /// Driver-reported identifier quoting, captured once after connect.
     /// Keeping this on the client avoids a connection-info RPC on every query.
     identifier_quote: Option<String>,
+    dedicated_transaction_query_cancel: bool,
 }
 
 /// Keeps serialized session RPC access separate from the process-level fail-stop handle.
@@ -899,6 +1181,7 @@ pub struct PooledAgentClient {
     shared_runtime: Option<Arc<AgentRuntimeClient>>,
     agent_session_id: Option<String>,
     identifier_quote: Option<String>,
+    compatibility_mode: Option<String>,
 }
 
 impl PooledAgentClient {
@@ -906,7 +1189,22 @@ impl PooledAgentClient {
         let shared_runtime = client.shared_runtime.clone();
         let agent_session_id = client.agent_session_id.clone();
         let identifier_quote = client.identifier_quote.clone();
-        Self { client: tokio::sync::Mutex::new(client), shared_runtime, agent_session_id, identifier_quote }
+        Self {
+            client: tokio::sync::Mutex::new(client),
+            shared_runtime,
+            agent_session_id,
+            identifier_quote,
+            compatibility_mode: None,
+        }
+    }
+
+    pub fn with_compatibility_mode(mut self, mode: Option<String>) -> Self {
+        self.compatibility_mode = mode.filter(|value| !value.trim().is_empty());
+        self
+    }
+
+    pub fn compatibility_mode(&self) -> Option<&str> {
+        self.compatibility_mode.as_deref()
     }
 
     pub fn identifier_quote(&self) -> Option<&str> {
@@ -962,16 +1260,24 @@ impl PooledAgentClient {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentLaunchSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub working_dir: Option<PathBuf>,
+    /// Extra environment variables handed to the agent process.
+    ///
+    /// This is part of the launch *identity*, not just the launch mechanics:
+    /// [`crate::agent_runtime::shared_runtime_key`] hashes it, so two launches
+    /// that differ only in `env` get separate agent processes. That is what
+    /// makes process-scoped Oracle Client settings (`NLS_LANG`) safe to set per
+    /// connection instead of leaking across connections that share a process.
+    pub env: Vec<(String, String)>,
 }
 
 impl AgentLaunchSpec {
     pub fn new(program: impl Into<PathBuf>) -> Self {
-        Self { program: program.into(), args: Vec::new(), working_dir: None }
+        Self { program: program.into(), args: Vec::new(), working_dir: None, env: Vec::new() }
     }
 
     pub fn java_jar(java_path: impl Into<PathBuf>, jar_path: impl AsRef<Path>) -> Self {
@@ -988,6 +1294,7 @@ impl AgentLaunchSpec {
             program: java_path.into(),
             args: agent_java_args_with_extra_args(&jar_path.to_string_lossy(), extra_java_args),
             working_dir: jar_path.parent().map(Path::to_path_buf),
+            env: Vec::new(),
         }
     }
 
@@ -1000,6 +1307,15 @@ impl AgentLaunchSpec {
         self.working_dir = Some(working_dir.into());
         self
     }
+
+    /// Appends `env` after any entries already present.
+    ///
+    /// Later entries win when [`Self::env`] is applied to the child process,
+    /// so callers can layer connection-level overrides on top of defaults.
+    pub fn with_env(mut self, env: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.env.extend(env);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1008,6 +1324,21 @@ pub struct AgentHandshake {
     pub protocol_version: u32,
     pub agent_protocol_version: u32,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub pl_debug: Option<NativePlDebugContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativePlDebugContract {
+    pub contract_version: u32,
+    pub helper_objects: bool,
+    #[serde(default)]
+    pub set_value_operation_status: bool,
+    #[serde(default)]
+    pub execute_operation_status: bool,
+    #[serde(default)]
+    pub breakpoint_operation_status: bool,
 }
 
 impl AgentHandshake {
@@ -1018,6 +1349,8 @@ impl AgentHandshake {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentCapability {
+    ExactMetadataIdentityV1,
+    BlobBindStatementsV1,
     Connect,
     TestConnection,
     Metadata,
@@ -1044,6 +1377,9 @@ pub enum AgentCapability {
     MongoBulkWrite,
     MongoRenameCollection,
     MongoFindCursor,
+    NativeJobLegacyV1,
+    NativeJobSessionV1,
+    NativeJobLegacyObV1,
     MultiSession,
     StructuredErrorV1,
 }
@@ -1126,7 +1462,7 @@ fn parse_agent_rpc_error_header(header: &str) -> (Option<i64>, String) {
 }
 
 impl AgentCapability {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 33] = [
         Self::Connect,
         Self::TestConnection,
         Self::Metadata,
@@ -1153,12 +1489,22 @@ impl AgentCapability {
         Self::MongoBulkWrite,
         Self::MongoRenameCollection,
         Self::MongoFindCursor,
+        Self::NativeJobLegacyV1,
+        Self::NativeJobSessionV1,
+        Self::ExactMetadataIdentityV1,
         Self::MultiSession,
         Self::StructuredErrorV1,
+        Self::BlobBindStatementsV1,
+        Self::NativeJobLegacyObV1,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::ExactMetadataIdentityV1 => "exact_metadata_identity_v1",
+            Self::BlobBindStatementsV1 => "blob_bind_statements_v1",
+            Self::NativeJobLegacyV1 => "native_job_legacy_v1",
+            Self::NativeJobSessionV1 => "native_job_session_v1",
+            Self::NativeJobLegacyObV1 => "native_job_legacy_ob_v1",
             Self::Connect => "connect",
             Self::TestConnection => "test_connection",
             Self::Metadata => "metadata",
@@ -1212,6 +1558,7 @@ pub enum AgentMethod {
     GetObjectSource,
     GetColumns,
     GetCustomTypeDetails,
+    PlDebugInspect,
     ListIndexes,
     ListForeignKeys,
     ListTriggers,
@@ -1225,6 +1572,8 @@ pub enum AgentMethod {
     ExecuteQueryPage,
     FetchQueryPage,
     CloseQuerySession,
+    ReadLargeValueChunk,
+    ReleaseLargeValue,
     StartTableRead,
     FetchTableReadPage,
     CloseTableReadSession,
@@ -1239,7 +1588,7 @@ pub enum AgentMethod {
 }
 
 impl AgentMethod {
-    pub const ALL: [Self; 41] = [
+    pub const ALL: [Self; 43] = [
         Self::Handshake,
         Self::Connect,
         Self::OpenSession,
@@ -1270,6 +1619,8 @@ impl AgentMethod {
         Self::ExecuteQueryPage,
         Self::FetchQueryPage,
         Self::CloseQuerySession,
+        Self::ReadLargeValueChunk,
+        Self::ReleaseLargeValue,
         Self::StartTableRead,
         Self::FetchTableReadPage,
         Self::CloseTableReadSession,
@@ -1305,6 +1656,7 @@ impl AgentMethod {
             Self::GetTableDdl => "get_table_ddl",
             Self::GetColumns => "get_columns",
             Self::GetCustomTypeDetails => "get_type_details",
+            Self::PlDebugInspect => "pl_debug_inspect",
             Self::ListIndexes => "list_indexes",
             Self::ListForeignKeys => "list_foreign_keys",
             Self::ListTriggers => "list_triggers",
@@ -1320,6 +1672,8 @@ impl AgentMethod {
             Self::StartTableRead => "start_table_read",
             Self::FetchTableReadPage => "fetch_table_read_page",
             Self::CloseTableReadSession => "close_table_read_session",
+            Self::ReadLargeValueChunk => "read_large_value_chunk",
+            Self::ReleaseLargeValue => "release_large_value",
             Self::GetExplainInfo => "get_explain_info",
             Self::ExecuteBatch => "execute_batch",
             Self::ExecuteTransaction => "execute_transaction",
@@ -1605,6 +1959,193 @@ impl StderrTail {
     }
 }
 
+struct ReadyAgentProcess {
+    child: Child,
+    stdin: BufWriter<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+    stderr_tail: Arc<Mutex<StderrTail>>,
+    startup_exit: Option<StartupChildExit>,
+}
+
+struct ChildStartupGuard {
+    child: Option<Child>,
+    armed: bool,
+    startup_exit: Option<StartupChildExit>,
+}
+
+impl std::ops::Deref for ChildStartupGuard {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        self.child.as_ref().expect("startup child already transferred")
+    }
+}
+
+impl std::ops::DerefMut for ChildStartupGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("startup child already transferred")
+    }
+}
+
+impl Drop for ChildStartupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(child) = self.child.take() {
+                terminate_and_reap_shared_agent(
+                    Arc::new(Mutex::new(child)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    self.startup_exit.take(),
+                );
+            }
+        }
+    }
+}
+
+impl ChildStartupGuard {
+    fn startup_error(&mut self, error: String, stderr_tail: &Arc<Mutex<StderrTail>>) -> String {
+        if self.armed {
+            let status = child_exit_status(self);
+            format_agent_process_error(&error, status, &stderr_tail_snapshot(stderr_tail))
+        } else {
+            clean_up_failed_agent_startup(error, self, stderr_tail)
+        }
+    }
+}
+
+fn startup_remaining(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "Agent startup deadline exceeded".to_string())
+}
+
+async fn spawn_ready_agent_process_before(
+    launch: &AgentLaunchSpec,
+    deadline: Instant,
+    startup: Option<&StartupCleanupGuard>,
+) -> Result<ReadyAgentProcess, String> {
+    startup_remaining(deadline)?;
+    match spawn_ready_agent_process_once_internal(launch, Some(deadline), startup).await {
+        Ok(process) => Ok(process),
+        Err(error) if is_retryable_agent_startup_error(&error) => {
+            let delay = Duration::from_millis(AGENT_STARTUP_RETRY_DELAY_MS);
+            if startup_remaining(deadline)? <= delay {
+                return Err("Agent startup deadline exceeded".to_string());
+            }
+            tokio::time::sleep(delay).await;
+            startup_remaining(deadline)?;
+            spawn_ready_agent_process_once_internal(launch, Some(deadline), startup).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn spawn_ready_agent_process(launch: &AgentLaunchSpec) -> Result<ReadyAgentProcess, String> {
+    match spawn_ready_agent_process_once(launch).await {
+        Ok(process) => Ok(process),
+        Err(error) if is_retryable_agent_startup_error(&error) => {
+            log::warn!("[agent] process exited before startup handshake; retrying once: {error}");
+            tokio::time::sleep(Duration::from_millis(AGENT_STARTUP_RETRY_DELAY_MS)).await;
+            spawn_ready_agent_process_once(launch).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn spawn_ready_agent_process_once(launch: &AgentLaunchSpec) -> Result<ReadyAgentProcess, String> {
+    spawn_ready_agent_process_once_internal(launch, None, None).await
+}
+
+async fn spawn_ready_agent_process_once_internal(
+    launch: &AgentLaunchSpec,
+    deadline: Option<Instant>,
+    startup: Option<&StartupCleanupGuard>,
+) -> Result<ReadyAgentProcess, String> {
+    if let Some(deadline) = deadline {
+        startup_remaining(deadline)?;
+    }
+    let mut child = ChildStartupGuard {
+        child: Some(spawn_agent_process(launch)?),
+        armed: deadline.is_some(),
+        startup_exit: startup.map(StartupCleanupGuard::child_started),
+    };
+    let child_stdin = child.stdin.take().ok_or("Failed to capture agent stdin")?;
+    let child_stdout = child.stdout.take().ok_or("Failed to capture agent stdout")?;
+    let child_stderr = child.stderr.take().ok_or("Failed to capture agent stderr")?;
+    let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
+    start_stderr_collector(child_stderr, stderr_tail.clone());
+
+    let startup_timeout = match deadline {
+        Some(deadline) => startup_remaining(deadline)?.min(Duration::from_secs(STARTUP_TIMEOUT_SECS)),
+        None => Duration::from_secs(STARTUP_TIMEOUT_SECS),
+    };
+    let mut stdout = BufReader::new(child_stdout);
+    let startup_result = tokio::time::timeout(
+        startup_timeout,
+        tokio::task::spawn_blocking(move || loop {
+            let line = read_agent_line(&mut stdout, "startup line")?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Value>(trimmed) {
+                Ok(value) if value.get("ready") == Some(&Value::Bool(true)) => return Ok(stdout),
+                Ok(_) => return Err(format!("Agent did not send ready signal, got: {line}")),
+                Err(_) => log::warn!("[agent:stdout] ignoring non-JSON line during startup: {trimmed}"),
+            }
+        }),
+    )
+    .await;
+
+    let stdout = match startup_result {
+        Ok(Ok(Ok(stdout))) => stdout,
+        Ok(Ok(Err(error))) => return Err(child.startup_error(error, &stderr_tail)),
+        Ok(Err(error)) => {
+            return Err(child.startup_error(format!("Agent startup task failed: {error}"), &stderr_tail));
+        }
+        Err(_) => {
+            return Err(child.startup_error(
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    "Agent startup deadline exceeded".to_string()
+                } else {
+                    format!("Agent startup timed out ({STARTUP_TIMEOUT_SECS}s)")
+                },
+                &stderr_tail,
+            ));
+        }
+    };
+
+    if let Some(deadline) = deadline {
+        startup_remaining(deadline)?;
+    }
+    Ok(ReadyAgentProcess {
+        child: child.child.take().expect("startup child already transferred"),
+        stdin: BufWriter::new(child_stdin),
+        stdout,
+        stderr_tail,
+        startup_exit: child.startup_exit.take(),
+    })
+}
+
+fn clean_up_failed_agent_startup(error: String, child: &mut Child, stderr_tail: &Arc<Mutex<StderrTail>>) -> String {
+    let error = format_agent_startup_error(&error, child, stderr_tail);
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    error
+}
+
+fn is_retryable_agent_startup_error(error: &str) -> bool {
+    error.contains("Failed to read startup line from agent: end of stream")
+        && !error.contains(AGENT_JAVA_TOO_OLD_MESSAGE)
+}
+
+/// Outcome of one blocking agent RPC read: the restored stdout reader, the
+/// deserialized result (or error) and the JSON-RPC id the reply carried.
+type AgentResponseOutcome<T> = (BufReader<ChildStdout>, Result<T, String>, Option<u64>);
+
 impl AgentDriverClient {
     /// Spawn an agent process and wait for it to signal readiness.
     ///
@@ -1612,73 +2153,21 @@ impl AgentDriverClient {
     /// they speak the DBX stdin/stdout JSON-RPC protocol.
     /// Blocks (async) until the agent writes `{"ready":true}` to stdout.
     pub async fn spawn(launch: AgentLaunchSpec) -> Result<Self, String> {
-        let mut child = spawn_agent_process(&launch)?;
-
-        let child_stdin = child.stdin.take().ok_or("Failed to capture agent stdin")?;
-        let child_stdout = child.stdout.take().ok_or("Failed to capture agent stdout")?;
-        let child_stderr = child.stderr.take().ok_or("Failed to capture agent stderr")?;
-
-        let stdin = BufWriter::new(child_stdin);
-        let mut stdout = BufReader::new(child_stdout);
-        let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
-        start_stderr_collector(child_stderr, stderr_tail.clone());
-
-        // Wait for the agent to signal readiness with {"ready":true}.
-        // Some JDBC drivers (e.g. DM8) write banners to stdout during class
-        // loading.  Skip non-JSON lines so driver output doesn't break the
-        // JSON-RPC handshake.
-        let startup_result = tokio::time::timeout(
-            Duration::from_secs(STARTUP_TIMEOUT_SECS),
-            tokio::task::spawn_blocking(move || loop {
-                let line = read_agent_line(&mut stdout, "startup line")?;
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Value>(trimmed) {
-                    Ok(v) if v.get("ready") == Some(&Value::Bool(true)) => return Ok(stdout),
-                    Ok(_) => return Err(format!("Agent did not send ready signal, got: {line}")),
-                    Err(_) => {
-                        log::warn!("[agent:stdout] ignoring non-JSON line during startup: {trimmed}");
-                        continue;
-                    }
-                }
-            }),
-        )
-        .await;
-
-        let ready_stdout = match startup_result {
-            Ok(Ok(Ok(stdout))) => stdout,
-            Ok(Ok(Err(e))) => {
-                return Err(format_agent_startup_error(&e, &mut child, &stderr_tail));
-            }
-            Ok(Err(e)) => {
-                return Err(format_agent_startup_error(
-                    &format!("Agent startup task failed: {e}"),
-                    &mut child,
-                    &stderr_tail,
-                ));
-            }
-            Err(_) => {
-                return Err(format_agent_startup_error(
-                    &format!("Agent startup timed out ({STARTUP_TIMEOUT_SECS}s)"),
-                    &mut child,
-                    &stderr_tail,
-                ));
-            }
-        };
+        let ReadyAgentProcess { child, stdin, stdout, stderr_tail, .. } = spawn_ready_agent_process(&launch).await?;
 
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
-            stdout: Some(ready_stdout),
+            stdout: Some(stdout),
             stderr_tail,
             handshake: None,
+            session_exact_metadata_identity: None,
             next_id: 0,
             shared_runtime: None,
             agent_session_id: None,
             cached_query: None,
             identifier_quote: None,
+            dedicated_transaction_query_cancel: false,
         })
     }
 
@@ -1689,11 +2178,13 @@ impl AgentDriverClient {
             stdout: None,
             stderr_tail: runtime.stderr_tail.clone(),
             handshake: Some(runtime.handshake().clone()),
+            session_exact_metadata_identity: None,
             next_id: 0,
             shared_runtime: Some(runtime),
             agent_session_id: Some(agent_session_id),
             cached_query: None,
             identifier_quote: None,
+            dedicated_transaction_query_cancel: false,
         }
     }
 
@@ -1793,8 +2284,65 @@ impl AgentDriverClient {
         let request_line =
             serde_json::to_string(&request).map_err(|e| format!("Failed to serialize JSON-RPC request: {e}"))?;
 
-        // Write request to stdin
-        let write_result = {
+        // A dedicated SQL Server query must remain cancellable even before
+        // the Agent consumes its JSON request. Keep other clients unchanged.
+        let mut timeout_duration = timeout_duration;
+        let write_result = if self.dedicated_transaction_query_cancel && method == AgentMethod::ExecuteQuery.as_str() {
+            if cancel_token.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                self.kill();
+                return Err(AgentCallError::Canceled {
+                    stage: agent_error_stage(method),
+                    operation_outcome: agent_operation_outcome(method),
+                });
+            }
+            let started = Instant::now();
+            let mut writer = self.stdin.take().ok_or("Agent stdin not available")?;
+            let mut write_task = tokio::task::spawn_blocking(move || {
+                let result = writer
+                    .write_all(request_line.as_bytes())
+                    .and_then(|_| writer.write_all(b"\n"))
+                    .and_then(|_| writer.flush())
+                    .map_err(|e| format!("Failed to write to agent stdin: {e}"));
+                (writer, result)
+            });
+            let result = tokio::select! {
+                // If the entire request is known to have been sent, restore the
+                // writer so cancellation can use JDBC cancel_session below.
+                biased;
+                result = &mut write_task => result,
+                _ = async {
+                    if let Some(token) = &cancel_token { token.cancelled().await; }
+                    else { std::future::pending::<()>().await; }
+                } => {
+                    // A partial JSON frame cannot be followed by another RPC.
+                    self.kill();
+                    return Err(AgentCallError::Canceled {
+                        stage: agent_error_stage(method), operation_outcome: agent_operation_outcome(method),
+                    });
+                },
+                _ = async {
+                    if let Some(duration) = timeout_duration { tokio::time::sleep(duration).await; }
+                    else { std::future::pending::<()>().await; }
+                } => {
+                    self.kill();
+                    return Err(AgentCallError::Timeout {
+                        stage: agent_error_stage(method), operation_outcome: agent_operation_outcome(method),
+                    });
+                },
+            };
+            let (writer, result) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    self.kill();
+                    return Err(AgentCallError::Transport { message: format!("Agent write task failed: {error}") });
+                }
+            };
+            self.stdin = Some(writer);
+            // Sending and receiving share one deadline, without granting a
+            // second timeout after a slow but successful write.
+            timeout_duration = timeout_duration.map(|duration| duration.saturating_sub(started.elapsed()));
+            result
+        } else {
             let writer = self.stdin.as_mut().ok_or("Agent stdin not available")?;
             writer
                 .write_all(request_line.as_bytes())
@@ -1811,12 +2359,13 @@ impl AgentDriverClient {
         // Read response from stdout (blocking, with timeout)
         let mut reader = self.stdout.take().ok_or("Agent stdout not available")?;
 
-        let response_task = tokio::task::spawn_blocking(move || {
+        let mut response_task = tokio::task::spawn_blocking(move || {
             let (line, resp) = match read_agent_json_response(&mut reader) {
                 Ok(response) => response,
-                Err(e) => return (reader, Err(e)),
+                Err(e) => return (reader, Err(e), None),
             };
 
+            let response_id = agent_json_rpc_response_id(&resp);
             let result = if let Some(err) = resp.get("error") {
                 Err(format_agent_rpc_error(err))
             } else if let Some(result_val) = resp.get("result") {
@@ -1826,23 +2375,23 @@ impl AgentDriverClient {
                 Err(format!("Agent response missing both 'result' and 'error': {line}"))
             };
 
-            (reader, result)
+            (reader, result, response_id)
         });
-        let (returned_reader, result) = match (timeout_duration, cancel_token) {
+        let (returned_reader, result, _) = match (timeout_duration, cancel_token) {
             (Some(duration), Some(token)) => {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => {
-                        self.kill();
+                        self.kill_after_dedicated_transaction_query_cancel(method, id, &mut response_task).await;
                         return Err(AgentCallError::Canceled {
                             stage: agent_error_stage(method),
                             operation_outcome: agent_operation_outcome(method),
                         });
                     }
-                    result = tokio::time::timeout(duration, response_task) => match result {
+                    result = tokio::time::timeout(duration, &mut response_task) => match result {
                         Ok(result) => result,
                         Err(_) => {
-                            self.kill();
+                            self.kill_after_dedicated_transaction_query_cancel(method, id, &mut response_task).await;
                             return Err(AgentCallError::Timeout {
                                 stage: agent_error_stage(method),
                                 operation_outcome: agent_operation_outcome(method),
@@ -1851,10 +2400,10 @@ impl AgentDriverClient {
                     },
                 }
             }
-            (Some(duration), None) => match tokio::time::timeout(duration, response_task).await {
+            (Some(duration), None) => match tokio::time::timeout(duration, &mut response_task).await {
                 Ok(result) => result,
                 Err(_) => {
-                    self.kill();
+                    self.kill_after_dedicated_transaction_query_cancel(method, id, &mut response_task).await;
                     return Err(AgentCallError::Timeout {
                         stage: agent_error_stage(method),
                         operation_outcome: agent_operation_outcome(method),
@@ -1865,13 +2414,13 @@ impl AgentDriverClient {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => {
-                        self.kill();
+                        self.kill_after_dedicated_transaction_query_cancel(method, id, &mut response_task).await;
                         return Err(AgentCallError::Canceled {
                             stage: agent_error_stage(method),
                             operation_outcome: agent_operation_outcome(method),
                         });
                     }
-                    result = response_task => result,
+                    result = &mut response_task => result,
                 }
             }
             (None, None) => response_task.await,
@@ -1890,6 +2439,73 @@ impl AgentDriverClient {
                 },
             )
             .map_err(|error| legacy_agent_call_error(error, self.agent_session_id.as_deref()))
+    }
+
+    /// Opt in only for isolated transaction clients using the v2 JDBC server.
+    /// Ordinary clients keep their existing immediate fail-stop behavior.
+    pub fn enable_dedicated_transaction_query_cancellation(&mut self) {
+        self.dedicated_transaction_query_cancel = true;
+    }
+
+    async fn kill_after_dedicated_transaction_query_cancel<T: Send + 'static>(
+        &mut self,
+        method: &str,
+        query_id: u64,
+        response_task: &mut tokio::task::JoinHandle<AgentResponseOutcome<T>>,
+    ) {
+        if self.dedicated_transaction_query_cancel
+            && method == AgentMethod::ExecuteQuery.as_str()
+            && self.handshake.as_ref().is_some_and(|handshake| {
+                handshake.protocol_version >= 2 && handshake.supports(AgentCapability::MultiSession)
+            })
+        {
+            self.next_id += 1;
+            let cancel_id = self.next_id;
+            // MultiSessionJsonRpcServer routes connect() clients to this singleton
+            // session. Its cancellation path does not acquire the executing RPC lock.
+            let request = serde_json::json!({
+                "jsonrpc": "2.0", "id": cancel_id, "method": "cancel_session",
+                "params": { "agentSessionId": "__legacy__" },
+            });
+            if let Some(mut writer) = self.stdin.take() {
+                // Moving the writer lets the independent child handle force kill
+                // even if a full stdin pipe blocks the write. Never restore stdin.
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    let writer = tokio::task::spawn_blocking(move || {
+                        writeln!(writer, "{request}").and_then(|_| writer.flush())?;
+                        Ok::<_, std::io::Error>(writer)
+                    })
+                    .await
+                    .map_err(|_| ())?
+                    .map_err(|_| ())?;
+                    // Keep stdin open until the replies arrive: EOF can make the
+                    // Agent exit before JDBC cancellation reaches the server.
+                    let (mut reader, _, first_id) = (&mut *response_task).await.map_err(|_| ())?;
+                    tokio::task::spawn_blocking(move || {
+                        let mut query_seen = first_id == Some(query_id);
+                        let mut cancel_seen = first_id == Some(cancel_id);
+                        while !query_seen || !cancel_seen {
+                            let (_, response) = read_agent_json_response(&mut reader)?;
+                            match agent_json_rpc_response_id(&response) {
+                                Some(id) if id == query_id => query_seen = true,
+                                Some(id) if id == cancel_id => cancel_seen = true,
+                                _ => {} // JSON logs and duplicate/unrelated ACKs cannot end the grace.
+                            }
+                        }
+                        Ok::<(), String>(())
+                    })
+                    .await
+                    .map_err(|_| ())?
+                    .map_err(|_| ())?;
+                    drop(writer);
+                    Ok::<(), ()>(())
+                })
+                .await;
+            }
+        }
+        // Cancellation always discards this connection, even after both replies.
+        // On an unresponsive Agent, killing also unblocks the stdio worker tasks.
+        self.kill();
     }
 
     pub async fn call_method<T: DeserializeOwned + Send + 'static>(
@@ -1947,7 +2563,13 @@ impl AgentDriverClient {
     }
 
     pub async fn connect(&mut self, params: Value) -> Result<Value, String> {
-        self.call_method(AgentMethod::Connect, params).await
+        let result = self.call_method(AgentMethod::Connect, params).await?;
+        self.apply_connect_result(&result);
+        Ok(result)
+    }
+
+    pub(crate) fn apply_connect_result(&mut self, result: &Value) {
+        self.session_exact_metadata_identity = result.get("exactMetadataIdentity").and_then(Value::as_bool);
     }
 
     pub async fn open_session(&mut self, agent_session_id: &str, mut params: Value) -> Result<Value, String> {
@@ -2121,6 +2743,30 @@ impl AgentDriverClient {
         object_types: Option<&[String]>,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
+        self.list_objects_with_options(
+            database,
+            schema,
+            filter,
+            limit,
+            offset,
+            object_types,
+            &Default::default(),
+            timeout_duration,
+        )
+        .await
+    }
+
+    pub async fn list_objects_with_options<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        filter: Option<&str>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        object_types: Option<&[String]>,
+        options: &dbx_types::oracle_trigger::MetadataReadOptions,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
         let mut params = agent_schema_params(database, schema);
         if let Some(filter) = filter.map(str::trim).filter(|filter| !filter.is_empty()) {
             params["filter"] = serde_json::json!(filter);
@@ -2135,6 +2781,7 @@ impl AgentDriverClient {
             params["object_types"] = serde_json::json!(object_types);
             params["objectTypes"] = serde_json::json!(object_types);
         }
+        options.apply_to(&mut params);
         self.call_method_with_timeout(AgentMethod::ListObjects, params, timeout_duration).await
     }
 
@@ -2196,9 +2843,68 @@ impl AgentDriverClient {
         relation_name: Option<&str>,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
+        self.get_object_source_with_identity(database, schema, name, object_type, None, relation_name, timeout_duration)
+            .await
+    }
+
+    pub async fn get_object_source_with_identity<T: DeserializeOwned + Send + 'static, K: Serialize>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        name: &str,
+        object_type: &K,
+        signature: Option<&str>,
+        relation_name: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
         self.call_method_with_timeout(
             AgentMethod::GetObjectSource,
-            agent_object_source_params_with_relation(database, schema, name, object_type, relation_name),
+            agent_object_source_params_with_identity(database, schema, name, object_type, signature, relation_name),
+            timeout_duration,
+        )
+        .await
+    }
+
+    pub async fn get_object_source_with_options<T: DeserializeOwned + Send + 'static, K: Serialize>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        name: &str,
+        object_type: &K,
+        signature: Option<&str>,
+        relation_name: Option<&str>,
+        options: &dbx_types::oracle_trigger::MetadataReadOptions,
+        include_source_origin: bool,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let mut params =
+            agent_object_source_params_with_identity(database, schema, name, object_type, signature, relation_name);
+        options.apply_to(&mut params);
+        if include_source_origin {
+            params["include_source_origin"] = serde_json::json!(true);
+        }
+        self.call_method_with_timeout(AgentMethod::GetObjectSource, params, timeout_duration).await
+    }
+
+    pub async fn get_object_source_with_origin<T: DeserializeOwned + Send + 'static, K: Serialize>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        name: &str,
+        object_type: &K,
+        signature: Option<&str>,
+        relation_name: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.get_object_source_with_options(
+            database,
+            schema,
+            name,
+            object_type,
+            signature,
+            relation_name,
+            &dbx_types::oracle_trigger::MetadataReadOptions::default(),
+            true,
             timeout_duration,
         )
         .await
@@ -2211,12 +2917,22 @@ impl AgentDriverClient {
         table: &str,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method_with_timeout(
-            AgentMethod::GetColumns,
-            agent_schema_table_params(database, schema, table),
-            timeout_duration,
-        )
-        .await
+        self.get_columns_in_context(database, schema, table, None, timeout_duration).await
+    }
+
+    pub async fn get_columns_in_context<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        current_schema: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let mut params = agent_schema_table_params(database, schema, table);
+        if let Some(current_schema) = current_schema {
+            params["current_schema"] = serde_json::json!(current_schema);
+        }
+        self.call_method_with_timeout(AgentMethod::GetColumns, params, timeout_duration).await
     }
 
     pub async fn get_custom_type_details<T: DeserializeOwned + Send + 'static>(
@@ -2288,12 +3004,20 @@ impl AgentDriverClient {
         table: &str,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method_with_timeout(
-            AgentMethod::ListTriggers,
-            agent_schema_table_params(database, schema, table),
-            timeout_duration,
-        )
-        .await
+        self.list_triggers_with_options(database, schema, table, &Default::default(), timeout_duration).await
+    }
+
+    pub async fn list_triggers_with_options<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        options: &dbx_types::oracle_trigger::MetadataReadOptions,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let mut params = agent_schema_table_params(database, schema, table);
+        options.apply_to(&mut params);
+        self.call_method_with_timeout(AgentMethod::ListTriggers, params, timeout_duration).await
     }
 
     pub async fn list_constraints<T: DeserializeOwned + Send + 'static>(
@@ -2550,6 +3274,17 @@ impl AgentDriverClient {
         self.call_method(AgentMethod::GetExplainInfo, params).await
     }
 
+    /// Estimated-plan RPC with the same session cancellation contract as queries.
+    pub async fn get_explain_info_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout_and_cancel(AgentMethod::GetExplainInfo, params, timeout_duration, cancel_token)
+            .await
+    }
+
     pub async fn close_query_session<T: DeserializeOwned + Send + 'static>(
         &mut self,
         session_id: &str,
@@ -2633,7 +3368,7 @@ impl AgentDriverClient {
         self.invalidate_cached_query();
         self.call_method_with_timeout(
             AgentMethod::ExecuteTransaction,
-            agent_transaction_params(database, statements, schema),
+            agent_statements_with_timeout_params(database, statements, schema, timeout_duration),
             timeout_duration,
         )
         .await
@@ -2649,7 +3384,7 @@ impl AgentDriverClient {
         self.invalidate_cached_query();
         self.call_method_typed_with_timeout(
             AgentMethod::ExecuteTransaction,
-            agent_transaction_params(database, statements, schema),
+            agent_statements_with_timeout_params(database, statements, schema, timeout_duration),
             timeout_duration,
         )
         .await
@@ -2683,7 +3418,7 @@ impl AgentDriverClient {
         self.invalidate_cached_query();
         self.call_method_with_timeout(
             AgentMethod::ExecuteBatch,
-            agent_transaction_params(database, statements, schema),
+            agent_statements_with_timeout_params(database, statements, schema, timeout_duration),
             timeout_duration,
         )
         .await
@@ -2699,7 +3434,33 @@ impl AgentDriverClient {
         self.invalidate_cached_query();
         self.call_method_typed_with_timeout(
             AgentMethod::ExecuteBatch,
-            agent_transaction_params(database, statements, schema),
+            agent_statements_with_timeout_params(database, statements, schema, timeout_duration),
+            timeout_duration,
+        )
+        .await
+    }
+
+    pub async fn execute_blob_bound_typed<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: Option<&str>,
+        previews: &[String],
+        bound: &[dbx_types::types::BlobBoundStatement],
+        schema: Option<&str>,
+        use_transaction: bool,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, AgentCallError> {
+        dbx_types::types::validate_blob_bound_statements(previews, bound)?;
+        if !self.handshake.as_ref().is_some_and(|handshake| handshake.supports(AgentCapability::BlobBindStatementsV1)) {
+            return Err("This Agent does not support bound BLOB saves; update the Agent before saving.".into());
+        }
+        self.invalidate_cached_query();
+        let mut params = agent_transaction_params(database, previews, schema);
+        params["boundStatements"] = serde_json::to_value(bound).map_err(|error| error.to_string())?;
+        params["queryTimeoutSecs"] =
+            serde_json::json!(timeout_duration.map(|duration| duration.as_secs().max(1)).unwrap_or(30));
+        self.call_method_typed_with_timeout(
+            if use_transaction { AgentMethod::ExecuteTransaction } else { AgentMethod::ExecuteBatch },
+            params,
             timeout_duration,
         )
         .await
@@ -2955,6 +3716,8 @@ impl AgentDriverClient {
 
     pub fn supports_capability(&self, capability: AgentCapability) -> bool {
         agent_supports_capability(self.handshake.as_ref(), capability)
+            && (capability != AgentCapability::ExactMetadataIdentityV1
+                || self.session_exact_metadata_identity != Some(false))
     }
 
     /// Send a shutdown message to the agent and wait for the process to exit.
@@ -3052,7 +3815,9 @@ pub fn is_unsupported_handshake_error(error: &str) -> bool {
 pub fn agent_supports_capability(handshake: Option<&AgentHandshake>, capability: AgentCapability) -> bool {
     if matches!(
         capability,
-        AgentCapability::Kv
+        AgentCapability::ExactMetadataIdentityV1
+            | AgentCapability::BlobBindStatementsV1
+            | AgentCapability::Kv
             | AgentCapability::KvTtl
             | AgentCapability::KvCas
             | AgentCapability::KvListValues
@@ -3096,8 +3861,23 @@ pub fn agent_object_source_params_with_relation<K: Serialize>(
     object_type: &K,
     relation_name: Option<&str>,
 ) -> Value {
+    agent_object_source_params_with_identity(database, schema, name, object_type, None, relation_name)
+}
+
+pub fn agent_object_source_params_with_identity<K: Serialize>(
+    database: &str,
+    schema: &str,
+    name: &str,
+    object_type: &K,
+    signature: Option<&str>,
+    relation_name: Option<&str>,
+) -> Value {
     let mut params =
         serde_json::json!({ "database": database, "schema": schema, "name": name, "object_type": object_type });
+    // An empty signature identifies the zero-argument overload; absence means unknown.
+    if let Some(signature) = signature {
+        params["signature"] = Value::String(signature.to_string());
+    }
     if let Some(relation_name) = relation_name.map(str::trim).filter(|value| !value.is_empty()) {
         params["relation_name"] = Value::String(relation_name.to_string());
     }
@@ -3119,6 +3899,18 @@ pub fn agent_transaction_params(database: Option<&str>, statements: &[String], s
         "statements": statements,
         "schema": schema,
     })
+}
+
+fn agent_statements_with_timeout_params(
+    database: Option<&str>,
+    statements: &[String],
+    schema: Option<&str>,
+    timeout: Option<Duration>,
+) -> Value {
+    let mut params = agent_transaction_params(database, statements, schema);
+    params["timeoutSecs"] =
+        serde_json::json!(timeout.map(|value| value.as_secs().clamp(1, i32::MAX as u64)).unwrap_or(0));
+    params
 }
 
 pub fn agent_manual_transaction_params(schema: Option<&str>) -> Value {
@@ -3320,6 +4112,9 @@ fn agent_command(launch: &AgentLaunchSpec) -> Command {
         command.current_dir(working_dir);
     }
     remove_agent_proxy_env(&mut command);
+    // Applied after the proxy scrub so an explicitly configured variable (for
+    // example an Oracle Client path) is never silently dropped.
+    command.envs(launch.env.iter().map(|(key, value)| (key.as_str(), value.as_str())));
     command
 }
 
@@ -3544,11 +4339,13 @@ impl AgentDriverClient {
             stdout: None,
             stderr_tail: Arc::new(Mutex::new(StderrTail::default())),
             handshake: None,
+            session_exact_metadata_identity: None,
             next_id: 0,
             shared_runtime: None,
             agent_session_id: None,
             cached_query: None,
             identifier_quote: None,
+            dedicated_transaction_query_cancel: false,
         }
     }
 
@@ -3575,13 +4372,18 @@ impl Drop for AgentDriverClient {
 }
 
 #[cfg(test)]
+#[path = "pl_debug_runtime_tests.rs"]
+mod pl_debug_runtime_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         agent_close_query_session_params, agent_error_from_legacy, agent_handshake_params, agent_java_args,
         agent_java_args_with_extra, agent_java_args_with_extra_opts, agent_object_source_params,
-        agent_object_source_params_with_relation, agent_process_error_hint, agent_proxy_env_vars, agent_schema_params,
-        agent_schema_table_params, agent_supports_capability, agent_transaction_params, append_legacy_error_context,
-        decode_agent_response, format_agent_process_error, format_agent_startup_error, is_agent_rpc_response_error,
+        agent_object_source_params_with_identity, agent_object_source_params_with_relation, agent_process_error_hint,
+        agent_proxy_env_vars, agent_schema_params, agent_schema_table_params, agent_supports_capability,
+        agent_transaction_params, append_legacy_error_context, decode_agent_response, format_agent_process_error,
+        format_agent_startup_error, is_agent_rpc_response_error, is_retryable_agent_startup_error,
         is_unsupported_handshake_error, legacy_agent_call_error, mongo_collection_params, mongo_database_params,
         mongo_document_id_params, parse_agent_java_opts, read_agent_json_response, read_agent_line,
         read_agent_line_with_limit, start_stderr_collector, validate_dameng_java_system_properties, AgentCallError,
@@ -3599,6 +4401,97 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn kingbase_connection_info_and_pool_preserve_reported_mode() {
+        let info: super::AgentConnectionInfo = serde_json::from_value(serde_json::json!({
+            "identifierQuote": "\"", "compatibilityMode": "oracle",
+            "databaseInfo": {"productName": "KingbaseES", "compatibilityMode": "oracle"}
+        }))
+        .unwrap();
+        assert_eq!(info.database_info.unwrap().compatibility_mode.as_deref(), Some("oracle"));
+        let client = AgentDriverClient {
+            child: None,
+            stdin: None,
+            stdout: None,
+            stderr_tail: Arc::new(Mutex::new(StderrTail::default())),
+            handshake: None,
+            session_exact_metadata_identity: None,
+            next_id: 0,
+            shared_runtime: None,
+            agent_session_id: None,
+            cached_query: None,
+            identifier_quote: None,
+            dedicated_transaction_query_cancel: false,
+        };
+        let pool = super::PooledAgentClient::new(client).with_compatibility_mode(info.compatibility_mode);
+        assert_eq!(pool.compatibility_mode(), Some("oracle"));
+        assert!(pool.with_compatibility_mode(Some(" ".into())).compatibility_mode().is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_narrows_exact_identity_only_for_the_connected_database() {
+        let script = std::env::temp_dir().join(format!("dbx-exact-connect-{}.py", uuid::Uuid::new_v4()));
+        std::fs::write(&script, r#"import json, sys
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    params = req.get('params', {})
+    if params.get('database') == 'failed':
+        print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'error': {'code': -1, 'message': 'connect failed'}}), flush=True)
+        continue
+    if req['method'] == 'handshake':
+        result = {'protocolVersion': 2, 'agentProtocolVersion': 2, 'capabilities': ['multi_session', 'exact_metadata_identity_v1']}
+    else:
+        result = {'ok': True}
+        if params.get('database') in ('legacy', 'modern'):
+            result['exactMetadataIdentity'] = params['database'] == 'modern'
+    print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)
+"#).unwrap();
+        let launch = AgentLaunchSpec::new(test_python()).with_args([script.to_string_lossy().to_string()]);
+        let mut client = AgentDriverClient::spawn(launch.clone()).await.unwrap();
+        client.try_optional_handshake("test").await.unwrap();
+        assert!(client.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        client.connect(serde_json::json!({"database": "legacy"})).await.unwrap();
+        assert!(!client.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        assert!(client.connect(serde_json::json!({"database": "failed"})).await.is_err());
+        assert!(!client.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        client.connect(serde_json::json!({"database": "modern"})).await.unwrap();
+        assert!(client.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        client.connect(serde_json::json!({"database": "legacy"})).await.unwrap();
+        client.connect(serde_json::json!({"database": "old-response"})).await.unwrap();
+        assert!(client.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        client.handshake.as_mut().unwrap().capabilities.retain(|capability| capability != "exact_metadata_identity_v1");
+        client.connect(serde_json::json!({"database": "modern"})).await.unwrap();
+        assert!(!client.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        client.shutdown().await;
+
+        let runtime = AgentRuntimeClient::spawn(launch, "test").await.unwrap();
+        let mut legacy = AgentDriverClient::shared_session(runtime.clone(), "legacy".into());
+        let mut modern = AgentDriverClient::shared_session(runtime.clone(), "modern".into());
+        for (database, session) in [("legacy", &mut legacy), ("modern", &mut modern)] {
+            let result = runtime
+                .call::<serde_json::Value>(
+                    "open_session",
+                    serde_json::json!({"database": database, "agentSessionId": database}),
+                    Some(Duration::from_secs(2)),
+                    None,
+                )
+                .await
+                .unwrap();
+            session.apply_connect_result(&result);
+        }
+        assert!(!legacy.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        assert!(modern.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        assert!(runtime.handshake().supports(AgentCapability::ExactMetadataIdentityV1));
+        let ordinary = legacy
+            .call::<serde_json::Value>("get_columns", serde_json::json!({"schema": "APP", "table": "T"}))
+            .await
+            .unwrap();
+        assert_eq!(ordinary["ok"], true);
+        runtime.kill_and_wait().await;
+        std::fs::remove_file(script).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]
@@ -4281,14 +5174,18 @@ mod tests {
     #[test]
     fn startup_error_waits_briefly_for_exit_status_and_stderr_tail() {
         let mut child = test_shell_command(
-            "sleep 0.05; echo 'java.lang.UnsupportedClassVersionError: class file version 65.0' >&2; exit 1",
-            "Start-Sleep -Milliseconds 50; [Console]::Error.WriteLine('java.lang.UnsupportedClassVersionError: class file version 65.0'); exit 1",
+            "echo ready; sleep 0.05; echo 'java.lang.UnsupportedClassVersionError: class file version 65.0' >&2; exit 1",
+            "[Console]::Out.WriteLine('ready'); Start-Sleep -Milliseconds 50; [Console]::Error.WriteLine('java.lang.UnsupportedClassVersionError: class file version 65.0'); exit 1",
         )
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("child should start");
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
         start_stderr_collector(child.stderr.take().expect("stderr should be piped"), Arc::clone(&stderr_tail));
+
+        let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout should be piped"));
+        assert_eq!(read_agent_line(&mut stdout, "test startup").unwrap().trim_end_matches(['\r', '\n']), "ready");
 
         std::thread::sleep(Duration::from_millis(200));
 
@@ -4311,6 +5208,68 @@ mod tests {
     }
 
     #[test]
+    fn startup_retry_only_accepts_premature_eof_without_java_version_failure() {
+        assert!(is_retryable_agent_startup_error(
+            "Failed to read startup line from agent: end of stream. agent process exited with exit code: 2"
+        ));
+        assert!(!is_retryable_agent_startup_error("Agent startup timed out (15s)"));
+        assert!(!is_retryable_agent_startup_error(&format!(
+            "{AGENT_JAVA_TOO_OLD_MESSAGE}. details: Failed to read startup line from agent: end of stream"
+        )));
+    }
+
+    #[tokio::test]
+    async fn shared_runtime_retries_once_after_premature_startup_eof() {
+        for observed in [false, true] {
+            let test_id = uuid::Uuid::new_v4();
+            let script_path = std::env::temp_dir().join(format!("dbx-agent-startup-retry-{test_id}.py"));
+            let counter_path = std::env::temp_dir().join(format!("dbx-agent-startup-retry-{test_id}.count"));
+            std::fs::write(
+                &script_path,
+                r#"import json, pathlib, sys
+counter_path = pathlib.Path(sys.argv[1])
+attempt = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
+counter_path.write_text(str(attempt))
+if attempt == 1:
+    print('transient startup failure', file=sys.stderr, flush=True)
+    sys.exit(2)
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    result = {'protocolVersion': 2, 'agentProtocolVersion': 2, 'capabilities': ['multi_session']}
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#,
+            )
+            .unwrap();
+
+            let launch = AgentLaunchSpec::new(test_python())
+                .with_args([script_path.to_string_lossy().to_string(), counter_path.to_string_lossy().to_string()]);
+            let (startup, cleanup) = crate::startup_cleanup::StartupCleanup::new_pair();
+            let runtime = if observed {
+                AgentRuntimeClient::spawn_before_observed(
+                    launch,
+                    "test",
+                    Instant::now() + Duration::from_secs(5),
+                    &startup,
+                )
+                .await
+            } else {
+                AgentRuntimeClient::spawn(launch, "test").await
+            }
+            .unwrap();
+            drop(startup);
+
+            assert_eq!(std::fs::read_to_string(&counter_path).unwrap(), "2");
+            runtime.kill_and_wait().await;
+            tokio::time::timeout(Duration::from_secs(3), cleanup.wait_until_settled()).await.unwrap();
+            assert_eq!(cleanup.snapshot().children_started, if observed { 2 } else { 0 });
+            assert_eq!(cleanup.snapshot().children_exited, if observed { 2 } else { 0 });
+            let _ = std::fs::remove_file(script_path);
+            let _ = std::fs::remove_file(counter_path);
+        }
+    }
+
+    #[test]
     fn runtime_agent_process_error_does_not_wait_for_live_child() {
         let child = test_shell_command("sleep 2", "Start-Sleep -Seconds 2")
             .stdin(Stdio::piped())
@@ -4324,11 +5283,13 @@ mod tests {
             stdout: None,
             stderr_tail: Arc::new(Mutex::new(StderrTail::default())),
             handshake: None,
+            session_exact_metadata_identity: None,
             next_id: 0,
             shared_runtime: None,
             agent_session_id: None,
             cached_query: None,
             identifier_quote: None,
+            dedicated_transaction_query_cancel: false,
         };
 
         let started_at = std::time::Instant::now();
@@ -4345,6 +5306,154 @@ mod tests {
             "Agent RPC error (-1): ETCD_CAS_CONFLICT: key changed after it was loaded"
         ));
         assert!(!is_agent_rpc_response_error("Failed to read response from agent: end of stream"));
+    }
+
+    #[tokio::test]
+    async fn dedicated_startup_cancellation_and_deadline_reap_before_channel_delivery() {
+        use std::io::Read;
+        for handshake in [false, true] {
+            for cancel in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let script = if handshake {
+                    "import socket,sys,time\nprint('{\"ready\":true}',flush=True)\nsys.stdin.readline()\ns=socket.create_connection(('127.0.0.1',int(sys.argv[1])))\ntime.sleep(30)\n"
+                } else {
+                    "import socket,sys,time\ns=socket.create_connection(('127.0.0.1',int(sys.argv[1])))\ntime.sleep(30)\n"
+                };
+                let launch = AgentLaunchSpec::new(test_python()).with_args([
+                    "-u".to_string(),
+                    "-c".to_string(),
+                    script.to_string(),
+                    port.to_string(),
+                ]);
+                let (startup, cleanup) = crate::startup_cleanup::StartupCleanup::new_pair();
+                let task = tokio::spawn(async move {
+                    AgentRuntimeClient::spawn_before_observed(
+                        launch,
+                        "test",
+                        Instant::now() + Duration::from_secs(2),
+                        &startup,
+                    )
+                    .await
+                });
+                listener.set_nonblocking(true).unwrap();
+                let connected = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            Err(error) => panic!("startup witness accept failed: {error}"),
+                        }
+                    }
+                })
+                .await;
+                if connected.is_err() {
+                    task.abort();
+                    panic!("agent did not reach startup stage (handshake={handshake})");
+                }
+                let mut stream = connected.unwrap();
+                stream.set_nonblocking(false).unwrap();
+                if cancel {
+                    task.abort();
+                    assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+                } else {
+                    let result = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+                    assert!(result.is_err());
+                }
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let closed = tokio::task::spawn_blocking(move || stream.read(&mut [0u8; 1])).await.unwrap();
+                match closed {
+                    Ok(0) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                        ) => {}
+                    other => panic!("startup child survived cancellation/deadline: {other:?}"),
+                }
+                tokio::time::timeout(Duration::from_secs(3), cleanup.wait_until_settled()).await.unwrap();
+                assert_eq!(cleanup.snapshot().children_started, 1);
+                assert_eq!(cleanup.snapshot().children_exited, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dedicated_startup_expired_deadline_never_launches() {
+        let error = AgentRuntimeClient::spawn_before(
+            AgentLaunchSpec::new("dbx-nonexistent-startup-test"),
+            "test",
+            Instant::now(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error, "Agent startup deadline exceeded");
+    }
+
+    #[tokio::test]
+    async fn dedicated_startup_cleanup_does_not_treat_a_poisoned_reaper_as_exit_confirmation() {
+        let (startup, cleanup) = crate::startup_cleanup::StartupCleanup::new_pair();
+        let launch = AgentLaunchSpec::new(test_python()).with_args([
+            "-u", "-c",
+            "import json,sys\nprint('{\"ready\":true}',flush=True)\nfor line in sys.stdin:\n r=json.loads(line)\n print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':{'protocolVersion':2,'agentProtocolVersion':2,'capabilities':['multi_session']}}),flush=True)\n",
+        ]);
+        let runtime = AgentRuntimeClient::spawn_before_observed(
+            launch,
+            "test",
+            Instant::now() + Duration::from_secs(5),
+            &startup,
+        )
+        .await
+        .unwrap();
+        drop(startup);
+        let child = runtime.child.clone();
+        let poisoned = std::thread::spawn(move || {
+            let _lock = child.lock().unwrap();
+            panic!("test-only child lock poison");
+        })
+        .join()
+        .is_err();
+        runtime.kill();
+        super::wait_for_shared_agent_reaper(runtime.child_reaped.clone()).await;
+        let failure_observed = tokio::time::timeout(Duration::from_secs(3), async {
+            while cleanup.snapshot().children_with_wait_failure == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let failed = cleanup.snapshot();
+        let actual_exit = {
+            let mut child = runtime.child.lock().unwrap_or_else(|error| error.into_inner());
+            let _ = child.kill();
+            child.wait().is_ok()
+        };
+        runtime.startup_exit.as_ref().unwrap().wait_finished(actual_exit);
+        assert!(poisoned);
+        assert!(failure_observed.is_ok());
+        assert_eq!(failed.children_exited, 0);
+        assert_eq!(failed.children_with_wait_failure, 1);
+        assert!(!failed.is_settled());
+        assert!(cleanup.snapshot().is_settled());
+        assert!(runtime.wait_for_exit(Duration::ZERO).await);
+    }
+
+    #[tokio::test]
+    async fn dedicated_startup_handoff_preserves_the_live_runtime() {
+        let launch = AgentLaunchSpec::new(test_python()).with_args([
+            "-u", "-c",
+            "import json,sys\nprint('{\"ready\":true}',flush=True)\nfor line in sys.stdin:\n r=json.loads(line)\n v={'protocolVersion':2,'agentProtocolVersion':2,'capabilities':['multi_session']} if r['method']=='handshake' else {'ok':True}\n print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':v}),flush=True)\n",
+        ]);
+        let runtime =
+            AgentRuntimeClient::spawn_before(launch, "test", Instant::now() + Duration::from_secs(5)).await.unwrap();
+        let reply: serde_json::Value =
+            runtime.call("probe", serde_json::json!({}), Some(Duration::from_secs(2)), None).await.unwrap();
+        assert_eq!(reply, serde_json::json!({"ok":true}));
+        assert!(!runtime.is_failed());
+        runtime.kill_and_wait().await;
+        assert!(runtime.child_reaped.load(Ordering::Acquire));
     }
 
     async fn spawn_stateful_test_runtime(prefix: &str) -> (Arc<AgentRuntimeClient>, std::path::PathBuf) {
@@ -4390,6 +5499,11 @@ def respond(req):
             value = cancel_count
         write_response(req, value)
         return
+    if method == 'blocked_count':
+        with state_lock:
+            value = len(blocked)
+        write_response(req, value)
+        return
     if method == 'cancel_session':
         session_id = params['agentSessionId']
         with state_lock:
@@ -4402,7 +5516,10 @@ def respond(req):
 
     session_id = params.get('agentSessionId', '__legacy__')
     with session_lock(session_id):
-        if method in ('execute_query', 'start_table_read'):
+        if method == 'get_columns':
+            write_response(req, params)
+            return
+        if method in ('execute_query', 'start_table_read', 'get_explain_info'):
             sql = params.get('sql', '')
             with state_lock:
                 query_count += 1
@@ -4447,6 +5564,43 @@ for line in sys.stdin:
 
     async fn runtime_counter(runtime: &Arc<AgentRuntimeClient>, method: &str) -> u64 {
         runtime.call(method, serde_json::json!({}), Some(Duration::from_secs(2)), None).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn columns_rpc_preserves_explicit_schema_and_optional_current_schema() {
+        let (runtime, script_path) = spawn_stateful_test_runtime("columns-context-test").await;
+        let mut client = AgentDriverClient::shared_session(runtime.clone(), "columns-session".to_string());
+
+        let contextual: serde_json::Value = client
+            .get_columns_in_context("APP", "", "ORDERS_ALIAS", Some("SelectedOwner"), Some(Duration::from_secs(2)))
+            .await
+            .unwrap();
+        assert_eq!(contextual["schema"], "");
+        assert_eq!(contextual["current_schema"], "SelectedOwner");
+        assert_eq!(contextual["table"], "ORDERS_ALIAS");
+        assert_eq!(contextual["agentSessionId"], "columns-session");
+
+        let qualified: serde_json::Value = client
+            .get_columns_in_context(
+                "APP",
+                "ActualOwner",
+                "ORDERS_ALIAS",
+                Some("SelectedOwner"),
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(qualified["schema"], "ActualOwner");
+        assert_eq!(qualified["current_schema"], "SelectedOwner");
+
+        let legacy: serde_json::Value =
+            client.get_columns("APP", "OWNER", "ORDERS_ALIAS", Some(Duration::from_secs(2))).await.unwrap();
+        assert_eq!(legacy["schema"], "OWNER");
+        assert!(legacy.get("current_schema").is_none());
+
+        runtime.kill();
+        wait_for_runtime_reap(&runtime).await;
+        let _ = std::fs::remove_file(script_path);
     }
 
     async fn wait_for_runtime_reap(runtime: &AgentRuntimeClient) {
@@ -4548,6 +5702,60 @@ for line in sys.stdin:
         let _ = std::fs::remove_file(script_path);
     }
 
+    #[tokio::test]
+    async fn native_explain_timeout_and_cancel_preserve_sibling_session() {
+        let (runtime, script_path) = spawn_stateful_test_runtime("native-explain-cancel-test").await;
+        let mut client = AgentDriverClient::shared_session(runtime.clone(), "explain-session".to_string());
+        let mut sibling = AgentDriverClient::shared_session(runtime.clone(), "editor-session".to_string());
+        let error = client
+            .get_explain_info_with_timeout_and_cancel::<serde_json::Value>(
+                serde_json::json!({"sql": "slow-timeout-plan"}),
+                Some(Duration::from_millis(75)),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("Agent RPC call timed out"));
+        // The cancel acknowledgement can precede the old worker's exit.
+        // Drain its session lock before watching the next blocked request.
+        client
+            .call_with_timeout::<serde_json::Value>("probe", serde_json::json!({}), Some(Duration::from_millis(500)))
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        let task = tokio::spawn(async move {
+            let result = client
+                .get_explain_info_with_timeout_and_cancel::<serde_json::Value>(
+                    serde_json::json!({"sql": "slow-unlimited-plan"}),
+                    None,
+                    Some(task_token),
+                )
+                .await;
+            (result, client)
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime_counter(&runtime, "blocked_count").await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        token.cancel();
+        let (result, mut client) = tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("Query canceled"), "{error}");
+        assert_eq!(runtime_counter(&runtime, "cancel_count").await, 2);
+        client
+            .call_with_timeout::<serde_json::Value>("probe", serde_json::json!({}), Some(Duration::from_millis(500)))
+            .await
+            .unwrap();
+        let response: serde_json::Value = sibling.call("probe", serde_json::json!({})).await.unwrap();
+        assert_eq!(response, serde_json::json!({"ok": true}));
+        assert!(!runtime.is_failed());
+        runtime.kill_and_wait().await;
+        let _ = std::fs::remove_file(script_path);
+    }
     #[tokio::test]
     async fn table_read_uses_the_supplied_rpc_timeout() {
         let (runtime, script_path) = spawn_stateful_test_runtime("table-read-timeout-test").await;
@@ -4769,6 +5977,231 @@ for line in sys.stdin:
         let _ = std::fs::remove_file(script_path);
     }
 
+    async fn dedicated_transaction_cancel_probe(order: &str, enabled: bool, timeout: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("agent.py");
+        let started = dir.path().join("started");
+        let marker = dir.path().join("cancel");
+        std::fs::write(&script, r#"import json, pathlib, sys
+root = pathlib.Path(sys.argv[1]); order = sys.argv[2]
+print(json.dumps({'ready': True}), flush=True)
+pending = None
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req['method']
+    if method == 'handshake':
+        print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{'protocolVersion':2,'agentProtocolVersion':2,'capabilities':['multi_session']}}),flush=True)
+    elif method == 'execute_query':
+        pending = req['id']; (root/'started').write_text('executing')
+    elif method == 'cancel_session':
+        assert req['params']['agentSessionId'] == '__legacy__'
+        assert req['id'] != pending
+        (root/'cancel').write_text('cancel_session:__legacy__')
+        query = {'jsonrpc':'2.0','id':pending,'error':{'code':-1,'message':'Query was cancelled'}}
+        ack = {'jsonrpc':'2.0','id':req['id'],'result':{'ok':True}}
+        frames = [query,ack] if order == 'query_first' else [ack,query]
+        if order == 'ack_only': frames = [ack]
+        if order == 'duplicate_ack': frames = [ack,ack]
+        if order == 'json_log': frames = [ack,{'id':pending,'message':'not a query response'}]
+        for frame in frames: print(json.dumps(frame),flush=True)
+"#).unwrap();
+        let mut client = AgentDriverClient::spawn(AgentLaunchSpec::new(test_python()).with_args([
+            script.to_string_lossy().to_string(),
+            dir.path().to_string_lossy().to_string(),
+            order.to_owned(),
+        ]))
+        .await
+        .unwrap();
+        client.try_optional_handshake("test").await.unwrap();
+        if enabled {
+            client.enable_dedicated_transaction_query_cancellation();
+        }
+        let token = CancellationToken::new();
+        let cancel_task = if timeout {
+            None
+        } else {
+            let cancellation = token.clone();
+            Some(tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !started.exists() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                cancellation.cancel();
+            }))
+        };
+        let began = Instant::now();
+        let error = client
+            .call_typed_with_timeout_and_cancel::<serde_json::Value>(
+                "execute_query",
+                serde_json::json!({"sql":"WAITFOR"}),
+                Some(if timeout { Duration::from_millis(100) } else { Duration::from_secs(3) }),
+                if timeout { None } else { Some(token) },
+            )
+            .await
+            .unwrap_err();
+        if timeout {
+            assert!(matches!(error, AgentCallError::Timeout { .. }));
+            assert!(began.elapsed() >= Duration::from_secs(5), "cancel ACK alone incorrectly confirmed completion");
+        } else {
+            assert!(matches!(error, AgentCallError::Canceled { .. }));
+        }
+        assert!(began.elapsed() < Duration::from_secs(7), "cancel grace did not remain bounded");
+        if enabled {
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "cancel_session:__legacy__");
+        } else {
+            assert!(!marker.exists(), "ordinary clients changed cancellation behavior");
+        }
+        assert!(
+            client.call::<serde_json::Value>("execute_query", serde_json::json!({})).await.is_err(),
+            "disposed transaction was reused"
+        );
+        if let Some(task) = cancel_task {
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dedicated_transaction_query_cancel_accepts_ack_before_query_response() {
+        dedicated_transaction_cancel_probe("ack_first", true, false).await;
+    }
+
+    #[tokio::test]
+    async fn dedicated_transaction_query_cancel_accepts_query_response_before_ack() {
+        dedicated_transaction_cancel_probe("query_first", true, false).await;
+    }
+
+    #[tokio::test]
+    async fn dedicated_transaction_query_cancel_timeout_does_not_treat_ack_as_completion() {
+        dedicated_transaction_cancel_probe("ack_only", true, true).await;
+    }
+
+    #[tokio::test]
+    async fn dedicated_transaction_query_cancel_timeout_ignores_duplicate_ack() {
+        dedicated_transaction_cancel_probe("duplicate_ack", true, true).await;
+    }
+
+    #[tokio::test]
+    async fn dedicated_transaction_query_cancel_timeout_ignores_json_logs() {
+        dedicated_transaction_cancel_probe("json_log", true, true).await;
+    }
+
+    async fn dedicated_transaction_initial_write_probe(timeout: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("unresponsive-agent.py");
+        std::fs::write(&script, r#"import json, sys, time
+print(json.dumps({'ready':True}),flush=True)
+req=json.loads(sys.stdin.readline())
+assert req['method']=='handshake'
+print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{'protocolVersion':2,'agentProtocolVersion':2,'capabilities':['multi_session']}}),flush=True)
+time.sleep(60)
+"#).unwrap();
+        let mut client = AgentDriverClient::spawn(
+            AgentLaunchSpec::new(test_python()).with_args([script.to_string_lossy().to_string()]),
+        )
+        .await
+        .unwrap();
+        client.try_optional_handshake("test").await.unwrap();
+        client.enable_dedicated_transaction_query_cancellation();
+        let token = CancellationToken::new();
+        let cancel_task = if timeout {
+            None
+        } else {
+            let cancellation = token.clone();
+            Some(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                cancellation.cancel();
+            }))
+        };
+        let began = Instant::now();
+        let error = client
+            .call_typed_with_timeout_and_cancel::<serde_json::Value>(
+                "execute_query",
+                serde_json::json!({"sql":" ".repeat(2 * 1024 * 1024)}),
+                Some(if timeout { Duration::from_millis(100) } else { Duration::from_secs(3) }),
+                if timeout { None } else { Some(token) },
+            )
+            .await
+            .unwrap_err();
+        if timeout {
+            assert!(matches!(error, AgentCallError::Timeout { operation_outcome: AgentOperationOutcome::Unknown, .. }));
+        } else {
+            assert!(matches!(
+                error,
+                AgentCallError::Canceled { operation_outcome: AgentOperationOutcome::Unknown, .. }
+            ));
+        }
+        assert!(began.elapsed() < Duration::from_secs(2), "initial request write blocked cancellation/deadline");
+        assert!(client.child.as_mut().unwrap().try_wait().unwrap().is_some());
+        assert!(client.stdin.is_none());
+        assert!(client.call::<serde_json::Value>("execute_query", serde_json::json!({})).await.is_err());
+        if let Some(task) = cancel_task {
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dedicated_transaction_query_cancel_interrupts_blocked_initial_write() {
+        dedicated_transaction_initial_write_probe(false).await;
+    }
+
+    #[tokio::test]
+    async fn dedicated_transaction_query_cancel_timeout_interrupts_blocked_initial_write() {
+        dedicated_transaction_initial_write_probe(true).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn dedicated_transaction_query_cancel_bounds_a_blocked_stdin_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("blocked-agent.py");
+        std::fs::write(&script, r#"import json, sys, time
+print(json.dumps({'ready':True}),flush=True)
+req=json.loads(sys.stdin.readline())
+assert req['method']=='handshake'
+print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{'protocolVersion':2,'agentProtocolVersion':2,'capabilities':['multi_session']}}),flush=True)
+# Never consume the next request. Windows' default anonymous pipe holds 4096 bytes.
+time.sleep(60)
+"#).unwrap();
+        let mut client = AgentDriverClient::spawn(
+            AgentLaunchSpec::new(test_python()).with_args([script.to_string_lossy().to_string()]),
+        )
+        .await
+        .unwrap();
+        client.try_optional_handshake("test").await.unwrap();
+        client.enable_dedicated_transaction_query_cancellation();
+        let empty_request = serde_json::json!({
+            "jsonrpc":"2.0", "id":client.next_id + 1,
+            "method":"execute_query", "params":{"sql":""},
+        });
+        let sql = " ".repeat(4096 - empty_request.to_string().len() - 1);
+        let began = Instant::now();
+        let error = client
+            .call_typed_with_timeout_and_cancel::<serde_json::Value>(
+                "execute_query",
+                serde_json::json!({"sql":sql}),
+                Some(Duration::from_millis(100)),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentCallError::Timeout { .. }));
+        assert!(began.elapsed() >= Duration::from_secs(5));
+        assert!(began.elapsed() < Duration::from_secs(7), "blocked cancel write prevented force kill");
+        assert!(
+            client.child.as_mut().unwrap().try_wait().unwrap().is_some(),
+            "unresponsive dedicated Agent was retained"
+        );
+        assert!(client.stdin.is_none());
+    }
+
+    #[tokio::test]
+    async fn dedicated_transaction_query_cancel_remains_opt_in() {
+        dedicated_transaction_cancel_probe("ack_first", false, false).await;
+    }
+
     #[tokio::test]
     async fn shared_runtime_tolerates_post_startup_driver_stdout_noise() {
         let script_path =
@@ -4873,6 +6306,42 @@ for line in sys.stdin:
 
         runtime.kill();
         let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn batch_and_transaction_send_statement_timeout_to_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("echo.py");
+        std::fs::write(
+            &script,
+            r#"import json, sys
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': req['params']}), flush=True)
+"#,
+        )
+        .unwrap();
+        let mut client = AgentDriverClient::spawn(
+            AgentLaunchSpec::new(test_python()).with_args([script.to_string_lossy().to_string()]),
+        )
+        .await
+        .unwrap();
+        let statements = ["UPDATE t SET a = 1".to_string()];
+        for timeout in [Some(Duration::from_secs(7)), None] {
+            let expected = if timeout.is_some() { 7 } else { 0 };
+            let results: [serde_json::Value; 4] = [
+                client.execute_batch(Some("db"), &statements, Some("schema"), timeout).await.unwrap(),
+                client.execute_batch_typed(Some("db"), &statements, Some("schema"), timeout).await.unwrap(),
+                client.execute_transaction(Some("db"), &statements, Some("schema"), timeout).await.unwrap(),
+                client.execute_transaction_typed(Some("db"), &statements, Some("schema"), timeout).await.unwrap(),
+            ];
+            for result in results {
+                assert_eq!(result["timeoutSecs"], expected);
+                assert_eq!(result["statements"], serde_json::json!(statements));
+            }
+        }
+        client.kill();
     }
 
     #[tokio::test]
@@ -5163,10 +6632,75 @@ for line in sys.stdin:
         assert_eq!(handshake.protocol_version, 1);
         assert_eq!(handshake.agent_protocol_version, 1);
         assert_eq!(handshake.capabilities, vec!["connect", "query", "metadata"]);
+        assert!(handshake.pl_debug.is_none());
+    }
+
+    #[test]
+    fn native_debug_handshake_rejects_incomplete_or_mistyped_contracts() {
+        for contract in [
+            serde_json::json!({"contractVersion": 1}),
+            serde_json::json!({"helperObjects": false}),
+            serde_json::json!({"contractVersion": "1", "helperObjects": false}),
+            serde_json::json!({"contractVersion": 1, "helperObjects": "false"}),
+        ] {
+            assert!(serde_json::from_value::<AgentHandshake>(serde_json::json!({
+                "protocolVersion": 2, "agentProtocolVersion": 2,
+                "capabilities": ["multi_session"], "plDebug": contract,
+            }))
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_blob_execution_rejects_unsupported_agents_and_edited_previews_before_rpc() {
+        let mut client = AgentDriverClient::test_stub();
+        let previews = vec!["reviewed BLOB save".to_string()];
+        let bound = vec![dbx_types::types::BlobBoundStatement {
+            preview_sql: previews[0].clone(),
+            sql: "UPDATE t SET b=?".into(),
+            blob_parameters: vec!["00ff80".into()],
+        }];
+        let error = client
+            .execute_blob_bound_typed::<serde_json::Value>(None, &previews, &bound, None, false, None)
+            .await
+            .unwrap_err();
+        assert!(error.into_legacy_string().contains("does not support bound BLOB"));
+        assert_eq!(client.next_id, 0);
+        client.handshake = Some(AgentHandshake {
+            protocol_version: AGENT_PROTOCOL_VERSION,
+            agent_protocol_version: AGENT_PROTOCOL_VERSION,
+            capabilities: vec!["blob_bind_statements_v1".into()],
+            pl_debug: None,
+        });
+        let error = client
+            .execute_blob_bound_typed::<serde_json::Value>(None, &["edited SQL".into()], &bound, None, true, None)
+            .await
+            .unwrap_err();
+        assert!(error.into_legacy_string().contains("changed"));
+        assert_eq!(client.next_id, 0);
     }
 
     #[test]
     fn defines_agent_protocol_capabilities() {
+        assert!(!agent_supports_capability(None, AgentCapability::BlobBindStatementsV1));
+        assert!(!agent_supports_capability(
+            Some(&AgentHandshake {
+                protocol_version: AGENT_PROTOCOL_VERSION,
+                agent_protocol_version: AGENT_PROTOCOL_VERSION,
+                capabilities: vec!["query".into()],
+                pl_debug: None,
+            }),
+            AgentCapability::BlobBindStatementsV1
+        ));
+        assert!(agent_supports_capability(
+            Some(&AgentHandshake {
+                protocol_version: AGENT_PROTOCOL_VERSION,
+                agent_protocol_version: AGENT_PROTOCOL_VERSION,
+                capabilities: vec!["blob_bind_statements_v1".into()],
+                pl_debug: None,
+            }),
+            AgentCapability::BlobBindStatementsV1
+        ));
         assert_eq!(AgentCapability::Connect.as_str(), "connect");
         assert_eq!(AgentCapability::TestConnection.as_str(), "test_connection");
         assert_eq!(AgentCapability::Metadata.as_str(), "metadata");
@@ -5195,7 +6729,12 @@ for line in sys.stdin:
         assert_eq!(AgentCapability::MongoFindCursor.as_str(), "mongo_find_cursor");
         assert_eq!(AgentCapability::MultiSession.as_str(), "multi_session");
         assert_eq!(AgentCapability::StructuredErrorV1.as_str(), "structured_error_v1");
-        assert_eq!(AgentCapability::ALL.len(), 28);
+        assert_eq!(AgentCapability::BlobBindStatementsV1.as_str(), "blob_bind_statements_v1");
+        assert_eq!(AgentCapability::NativeJobLegacyV1.as_str(), "native_job_legacy_v1");
+        assert_eq!(AgentCapability::NativeJobSessionV1.as_str(), "native_job_session_v1");
+        assert_eq!(AgentCapability::NativeJobLegacyObV1.as_str(), "native_job_legacy_ob_v1");
+        assert_eq!(AgentCapability::ExactMetadataIdentityV1.as_str(), "exact_metadata_identity_v1");
+        assert_eq!(AgentCapability::ALL.len(), 33);
     }
 
     #[test]
@@ -5511,6 +7050,25 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn object_source_params_preserve_overload_identity() {
+        for signature in ["", "v integer", "v INOUT integer"] {
+            assert_eq!(
+                agent_object_source_params_with_identity("onepass", "app", "run", &"PROCEDURE", Some(signature), None),
+                serde_json::json!({
+                    "database": "onepass", "schema": "app", "name": "run",
+                    "object_type": "PROCEDURE", "signature": signature,
+                })
+            );
+        }
+        let params = agent_object_source_params_with_identity("onepass", "app", "run", &"PROCEDURE", None, None);
+        assert!(params.get("signature").is_none());
+        let params =
+            agent_object_source_params_with_identity("onepass", "app", "audit", &"TRIGGER", None, Some("orders"));
+        assert_eq!(params["relation_name"], "orders");
+        assert!(params.get("signature").is_none());
+    }
+
+    #[test]
     fn agent_protocol_matches_contract_file() {
         let contract: serde_json::Value =
             serde_json::from_str(include_str!("../assets/agent-protocol-v2.json")).unwrap();
@@ -5547,6 +7105,7 @@ for line in sys.stdin:
             protocol_version: AGENT_PROTOCOL_VERSION,
             agent_protocol_version: AGENT_PROTOCOL_VERSION,
             capabilities: vec!["connect".to_string(), "metadata".to_string()],
+            pl_debug: None,
         };
 
         assert!(handshake.supports(AgentCapability::Connect));
@@ -5556,11 +7115,27 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn exact_metadata_identity_requires_explicit_process_support() {
+        assert!(!agent_supports_capability(None, AgentCapability::ExactMetadataIdentityV1));
+        let mut handshake = AgentHandshake {
+            protocol_version: AGENT_PROTOCOL_VERSION,
+            agent_protocol_version: AGENT_PROTOCOL_VERSION,
+            capabilities: vec!["metadata".into()],
+            pl_debug: None,
+        };
+        assert!(agent_supports_capability(Some(&handshake), AgentCapability::Metadata));
+        assert!(!agent_supports_capability(Some(&handshake), AgentCapability::ExactMetadataIdentityV1));
+        handshake.capabilities.push("exact_metadata_identity_v1".into());
+        assert!(agent_supports_capability(Some(&handshake), AgentCapability::ExactMetadataIdentityV1));
+    }
+
+    #[test]
     fn treats_missing_handshake_as_legacy_capability_support() {
         let handshake = AgentHandshake {
             protocol_version: AGENT_PROTOCOL_VERSION,
             agent_protocol_version: AGENT_PROTOCOL_VERSION,
             capabilities: vec!["connect".to_string()],
+            pl_debug: None,
         };
 
         assert!(agent_supports_capability(None, AgentCapability::Query));

@@ -19,6 +19,7 @@ const editorPreviewCalls = vi.hoisted(() => [] as Array<{ tabId: string; range: 
 const editorFocusCalls = vi.hoisted(() => [] as Array<{ tabId: string; range: unknown }>);
 const groupHandleModRCalls = vi.hoisted(() => [] as Element[]);
 const groupFocusWhereCalls = vi.hoisted(() => [] as string[]);
+const groupOpenTableStructureEditorCalls = vi.hoisted(() => [] as string[]);
 const groupFocusSearchCalls = vi.hoisted(() => [] as Array<Element | null>);
 const resultHandleModRCalls = vi.hoisted(() => [] as Element[]);
 const resultFocusSearchCalls = vi.hoisted(() => [] as boolean[]);
@@ -46,6 +47,10 @@ vi.mock("@/components/layout/EditorGroup.vue", () => ({
         groupFocusWhereCalls.push(this.groupId);
         return true;
       },
+      openTableStructureEditor(this: { groupId: string }) {
+        groupOpenTableStructureEditorCalls.push(this.groupId);
+        return true;
+      },
       focusSearch(target?: Element | null) {
         groupFocusSearchCalls.push(target ?? null);
         return true;
@@ -56,6 +61,10 @@ vi.mock("@/components/layout/EditorGroup.vue", () => ({
       },
       requestQueryEditorExecute(this: { groupId: string }) {
         groupExecutionCalls.request.push(this.groupId);
+        return true;
+      },
+      requestQueryEditorExecuteAll(this: { groupId: string }) {
+        groupExecutionCalls.request.push(`all:${this.groupId}`);
         return true;
       },
     },
@@ -163,6 +172,7 @@ describe("SqlEditorWorkspace mount contract", () => {
     groupHandleModRCalls.length = 0;
     groupFocusSearchCalls.length = 0;
     groupFocusWhereCalls.length = 0;
+    groupOpenTableStructureEditorCalls.length = 0;
     resultHandleModRCalls.length = 0;
     resultFocusSearchCalls.length = 0;
     groupExecutionCalls.capture.length = 0;
@@ -204,6 +214,7 @@ describe("SqlEditorWorkspace mount contract", () => {
     const vm = app.mount(host) as unknown as {
       captureQueryEditorExecutionSnapshot: (tabId?: string) => { selectedSql: string } | undefined;
       requestQueryEditorExecute: (tabId?: string) => boolean;
+      requestQueryEditorExecuteAll: (tabId?: string) => boolean;
     };
     await nextTick();
 
@@ -211,7 +222,8 @@ describe("SqlEditorWorkspace mount contract", () => {
     expect(snapshot?.selectedSql).toBe("SELECT g2");
     expect(groupExecutionCalls.capture).toEqual(["g2"]);
     expect(vm.requestQueryEditorExecute("tab-b")).toBe(true);
-    expect(groupExecutionCalls.request).toEqual(["g2"]);
+    expect(vm.requestQueryEditorExecuteAll("tab-b")).toBe(true);
+    expect(groupExecutionCalls.request).toEqual(["g2", "all:g2"]);
 
     app.unmount();
     host.remove();
@@ -744,16 +756,20 @@ describe("SqlEditorWorkspace mount contract", () => {
     });
     app.use(pinia);
     app.use(i18n);
-    const vm = app.mount(host) as unknown as { focusWhere: () => boolean };
+    const vm = app.mount(host) as unknown as { focusWhere: () => boolean; openTableStructureEditor: () => boolean };
     try {
       await nextTick();
       expect(vm.focusWhere()).toBe(true);
       expect(groupFocusWhereCalls).toEqual(["g1"]);
+      expect(vm.openTableStructureEditor()).toBe(true);
+      expect(groupOpenTableStructureEditorCalls).toEqual(["g1"]);
       store.focusedGroupId = "g2";
       store.activeTabId = "data-b";
       await nextTick();
       expect(vm.focusWhere()).toBe(true);
       expect(groupFocusWhereCalls).toEqual(["g1", "g2"]);
+      expect(vm.openTableStructureEditor()).toBe(true);
+      expect(groupOpenTableStructureEditorCalls).toEqual(["g1", "g2"]);
     } finally {
       app.unmount();
       host.remove();

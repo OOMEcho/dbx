@@ -9,7 +9,7 @@ use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{broadcast, oneshot, watch, Mutex, RwLock};
 use tokio::time::Instant;
 
@@ -18,6 +18,14 @@ use super::{
     SUPPORTED_PLUGIN_HOST_FEATURES, SUPPORTED_PLUGIN_PROTOCOL_VERSION,
 };
 use dbx_platform::ssh_prompt;
+
+/// A request failed this way without the host observing the end of the
+/// handler, so the plugin may still be executing it. Lifecycle callers treat
+/// the outcome as unconfirmed instead of assuming the request died with the
+/// abandoned caller.
+pub(super) fn request_may_still_execute(error: &str) -> bool {
+    error.contains("timed out after") || error.contains("was waiting for user input")
+}
 
 pub const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Host API method a plugin backend calls to ask the user for input
@@ -158,7 +166,8 @@ pub struct PluginSidecarSession {
     plugin: InstalledPlugin,
     app_version: String,
     transport: PluginBackendTransport,
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<crate::process::ManagedChild>>,
+    shutdown_lock: Mutex<()>,
     stdin: Mutex<ChildStdin>,
     pending: Arc<Mutex<HashMap<u64, PendingResponse>>>,
     next_request_id: AtomicU64,
@@ -170,6 +179,63 @@ pub struct PluginSidecarSession {
     /// request deadlines of this session so a user typing an MFA code cannot
     /// fail a plugin `connection/test` or `connection/connect` call.
     prompts: PromptActivity,
+    owner_runtime: tokio::runtime::Handle,
+    /// Last stderr lines, used to explain a sidecar that dies during startup.
+    stderr_tail: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    stderr_closed: watch::Sender<bool>,
+    stdout_closed: std::sync::atomic::AtomicBool,
+    // Kept until the session (including its child/image handle) is completely dropped.
+    _runtime_lease: Option<std::fs::File>,
+}
+
+/// Shown when a Java sidecar (the JDBC plugin) was started by a runtime older
+/// than its bytecode. Kept verbatim in sync with the desktop error catalog
+/// (apps/desktop/src/i18n/backend-errors.ts -> connection.agentJavaTooOld).
+pub const PLUGIN_JAVA_TOO_OLD_MESSAGE: &str =
+    "Plugin requires Java 21, but DBX started it with an older Java runtime. Use DBX managed JRE 21 or select a Java 21 executable in Driver Manager.";
+const STDERR_TAIL_LINES: usize = 20;
+const STDERR_TAIL_LINE_CHARS: usize = 2000;
+const STDERR_CLOSE_WAIT: Duration = Duration::from_millis(500);
+
+fn plugin_stderr_hint(stderr: &str) -> Option<&'static str> {
+    let lower = stderr.to_ascii_lowercase();
+    // Match the JVM wording variants independently: the tail keeps only the
+    // last lines, so a long stack trace can push the exception header out.
+    if lower.contains("unsupportedclassversionerror")
+        || lower.contains("only recognizes class file versions up to")
+        || lower.contains("has been compiled by a more recent version of the java runtime")
+    {
+        return Some(PLUGIN_JAVA_TOO_OLD_MESSAGE);
+    }
+    None
+}
+
+/// Cancelled discovery/initialization must not leave the stdout task and child owning each other.
+pub(super) struct ShutdownOnDrop(Option<Arc<PluginSidecarSession>>);
+
+impl ShutdownOnDrop {
+    pub(super) fn new(session: Arc<PluginSidecarSession>) -> Self {
+        Self(Some(session))
+    }
+    pub(super) fn disarm(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let Some(session) = self.0.take() else { return };
+        if session.status().state == PluginSessionState::Stopped {
+            return;
+        }
+        // Pool/session owners can also be dropped from a blocking thread.
+        let runtime = session.owner_runtime.clone();
+        runtime.spawn(async move {
+            if let Err(error) = session.shutdown().await {
+                log::warn!("{error}");
+            }
+        });
+    }
 }
 
 /// Tracks whether this plugin session has a user prompt open, and wakes the
@@ -213,13 +279,22 @@ impl PluginSidecarSession {
         app_version: impl Into<String>,
         env: PluginRuntimeEnv,
     ) -> Result<Arc<Self>, String> {
+        Self::start_with_runtime_lease(plugin, app_version, env, None).await
+    }
+
+    pub(super) async fn start_with_runtime_lease(
+        plugin: InstalledPlugin,
+        app_version: impl Into<String>,
+        env: PluginRuntimeEnv,
+        runtime_lease: Option<std::fs::File>,
+    ) -> Result<Arc<Self>, String> {
         ensure_plugin_backend(&plugin)?;
         let transport = plugin.manifest.backend_entrypoint().map(|backend| backend.transport).unwrap_or_default();
         let app_version = app_version.into();
-        let mut child = spawn_plugin_child(&plugin, &app_version, &env)?;
-        let stdin = child.stdin.take().ok_or("Plugin stdin unavailable")?;
-        let stdout = child.stdout.take().ok_or("Plugin stdout unavailable")?;
-        let stderr = child.stderr.take();
+        let mut child = spawn_plugin_child(&plugin, &app_version, &env).await?;
+        let stdin = child.take_stdin().ok_or("Plugin stdin unavailable")?;
+        let stdout = child.take_stdout().ok_or("Plugin stdout unavailable")?;
+        let stderr = child.take_stderr();
         let child = Arc::new(Mutex::new(child));
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (events, _) = broadcast::channel(256);
@@ -230,6 +305,7 @@ impl PluginSidecarSession {
             app_version,
             transport,
             child,
+            shutdown_lock: Mutex::new(()),
             stdin: Mutex::new(stdin),
             pending,
             next_request_id: AtomicU64::new(1),
@@ -238,8 +314,14 @@ impl PluginSidecarSession {
             status,
             handshake: RwLock::new(None),
             prompts: PromptActivity::default(),
+            owner_runtime: tokio::runtime::Handle::current(),
+            stderr_tail: Default::default(),
+            stderr_closed: watch::channel(stderr.is_none()).0,
+            stdout_closed: Default::default(),
+            _runtime_lease: runtime_lease,
         });
 
+        let startup = ShutdownOnDrop::new(session.clone());
         session.spawn_stdout_reader(stdout);
         if let Some(stderr) = stderr {
             session.spawn_stderr_reader(stderr);
@@ -249,8 +331,13 @@ impl PluginSidecarSession {
             let handshake = match session.initialize().await {
                 Ok(handshake) => handshake,
                 Err(error) => {
-                    session.shutdown().await;
-                    return Err(format!("Plugin '{}' initialization failed: {error}", session.plugin.manifest.id));
+                    let shutdown_error = session.shutdown().await.err();
+                    let message = match shutdown_error {
+                        Some(shutdown_error) => format!("{error}; additionally failed to shut down: {shutdown_error}"),
+                        None => error,
+                    };
+                    let message = format!("Plugin '{}' initialization failed: {message}", session.plugin.manifest.id);
+                    return Err(session.with_stderr_hint(message).await);
                 }
             };
             *session.handshake.write().await = Some(handshake);
@@ -264,13 +351,16 @@ impl PluginSidecarSession {
         });
         if !transitioned {
             let status = session.status();
-            session.shutdown().await;
-            return Err(format!(
-                "Plugin '{}' stopped during initialization{}",
-                session.plugin.manifest.id,
-                status.message.map_or_else(String::new, |message| format!(": {message}"))
-            ));
+            let shutdown_error = session.shutdown().await.err();
+            let message = status.message.map_or_else(String::new, |message| format!(": {message}"));
+            let shutdown_error = shutdown_error.map_or_else(String::new, |error| format!("; shutdown failed: {error}"));
+            let message = format!(
+                "Plugin '{}' stopped during initialization{message}{shutdown_error}",
+                session.plugin.manifest.id
+            );
+            return Err(session.with_stderr_hint(message).await);
         }
+        startup.disarm();
         Ok(session)
     }
 
@@ -354,14 +444,42 @@ impl PluginSidecarSession {
         stdin.flush().await.map_err(|error| self.write_error(error))
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> Result<(), String> {
+        let _shutdown = self.shutdown_lock.lock().await;
+        if self.status().state == PluginSessionState::Stopped {
+            return Ok(());
+        }
+
         self.status.send_replace(PluginSessionStatus::new(PluginSessionState::Stopping, None));
         // Let any open user prompt resolve and close its dialog.
         self.prompts.close();
-        let kill_result = self.child.lock().await.kill().await;
-        let message = kill_result.err().map(|error| error.to_string());
+        // Stop the whole sidecar process tree, not just the tracked child. Script launchers can
+        // leave descendants that keep using the plugin container, which makes the rename-first
+        // uninstall fail with ERROR_ACCESS_DENIED even though the launcher itself is gone
+        // (#10601). `terminate()` is bounded by construction, so the app-exit path (`stop_all`)
+        // can never wait on it indefinitely: on Windows it terminates the private Job Object and
+        // confirms the tree has no active processes before reaping the launcher, and on other
+        // platforms it keeps tokio's direct-child kill semantics. The executable image lock is
+        // released when the session holding the `kill_on_drop` child drops, which uninstall
+        // performs before renaming the plugin directory (#10943).
+        let termination = self
+            .child
+            .lock()
+            .await
+            .terminate()
+            .await
+            .map_err(|error| format!("Failed to stop plugin '{}' process tree: {error}", self.plugin.manifest.id));
         fail_pending(&self.pending, "Plugin session stopped").await;
-        self.status.send_replace(PluginSessionStatus::new(PluginSessionState::Stopped, message));
+        match termination {
+            Ok(()) => {
+                self.status.send_replace(PluginSessionStatus::new(PluginSessionState::Stopped, None));
+                Ok(())
+            }
+            Err(error) => {
+                self.status.send_replace(PluginSessionStatus::new(PluginSessionState::Stopping, Some(error.clone())));
+                Err(error)
+            }
+        }
     }
 
     pub async fn pid(&self) -> Option<u32> {
@@ -398,6 +516,30 @@ impl PluginSidecarSession {
     }
 
     async fn invoke_value(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        driver: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<serde_json::Value, String> {
+        let result = self.invoke_value_unhinted(method, params, driver, timeout_duration).await;
+        match result {
+            // Legacy sidecars (the JDBC plugin) skip `plugin/initialize`, so a
+            // JVM that dies at startup first surfaces as a failed request.
+            // A write can hit the broken pipe before stdout reports EOF.
+            Err(error) if self.process_output_closed() || error.starts_with("Failed to write to plugin") => {
+                Err(self.with_stderr_hint(error).await)
+            }
+            result => result,
+        }
+    }
+
+    fn process_output_closed(&self) -> bool {
+        self.stdout_closed.load(Ordering::Acquire)
+            || !matches!(self.status().state, PluginSessionState::Starting | PluginSessionState::Running)
+    }
+
+    async fn invoke_value_unhinted(
         &self,
         method: &str,
         params: serde_json::Value,
@@ -551,6 +693,7 @@ impl PluginSidecarSession {
                 Ok(()) => session.exit_message().await,
                 Err(error) => error,
             };
+            session.stdout_closed.store(true, Ordering::Release);
             fail_pending(&session.pending, &message).await;
             // A plugin that died mid-prompt can no longer answer it.
             session.prompts.close();
@@ -570,11 +713,21 @@ impl PluginSidecarSession {
 
     fn spawn_stderr_reader(self: &Arc<Self>, stderr: tokio::process::ChildStderr) {
         let plugin_id = self.plugin.manifest.id.clone();
+        let tail = self.stderr_tail.clone();
+        let closed = self.stderr_closed.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             loop {
                 match read_limited_line(&mut reader, MAX_JSON_MESSAGE_BYTES).await {
-                    Ok(Some(line)) => log::warn!("[plugin:{plugin_id}] {}", String::from_utf8_lossy(&line).trim_end()),
+                    Ok(Some(line)) => {
+                        let line = String::from_utf8_lossy(&line).trim_end().to_string();
+                        log::warn!("[plugin:{plugin_id}] {line}");
+                        let mut tail = tail.lock().unwrap_or_else(|error| error.into_inner());
+                        if tail.len() == STDERR_TAIL_LINES {
+                            tail.pop_front();
+                        }
+                        tail.push_back(line.chars().take(STDERR_TAIL_LINE_CHARS).collect());
+                    }
                     Ok(None) => break,
                     Err(error) => {
                         log::warn!("[plugin:{plugin_id}] failed to read stderr: {error}");
@@ -582,7 +735,27 @@ impl PluginSidecarSession {
                     }
                 }
             }
+            closed.send_replace(true);
         });
+    }
+
+    /// Puts a known cause found in the sidecar's stderr in front of a startup
+    /// error. Waits briefly for stderr to drain, since the JVM can close stdout
+    /// before its class-version error has been read.
+    async fn with_stderr_hint(&self, message: String) -> String {
+        if message.contains(PLUGIN_JAVA_TOO_OLD_MESSAGE) {
+            return message;
+        }
+        let mut closed = self.stderr_closed.subscribe();
+        let _ = tokio::time::timeout(STDERR_CLOSE_WAIT, closed.wait_for(|closed| *closed)).await;
+        let stderr = {
+            let tail = self.stderr_tail.lock().unwrap_or_else(|error| error.into_inner());
+            tail.iter().cloned().collect::<Vec<_>>().join("\n")
+        };
+        match plugin_stderr_hint(&stderr) {
+            Some(hint) => format!("{hint} Details: {message}; recent stderr:\n{stderr}"),
+            None => message,
+        }
     }
 
     async fn exit_message(&self) -> String {
@@ -594,14 +767,9 @@ impl PluginSidecarSession {
     }
 
     async fn terminate_after_output_end(&self, message: String) -> String {
-        let mut child = self.child.lock().await;
-        match child.try_wait() {
-            Ok(Some(_)) => message,
-            Ok(None) => match child.kill().await {
-                Ok(()) => format!("{message}; process terminated by host"),
-                Err(error) => format!("{message}; failed to terminate process: {error}"),
-            },
-            Err(error) => format!("{message}; failed to inspect process: {error}"),
+        match self.child.lock().await.terminate().await {
+            Ok(()) => format!("{message}; process tree terminated by host"),
+            Err(error) => format!("{message}; failed to terminate process tree: {error}"),
         }
     }
 
@@ -1048,7 +1216,11 @@ fn ensure_plugin_backend(plugin: &InstalledPlugin) -> Result<(), String> {
     Ok(())
 }
 
-fn spawn_plugin_child(plugin: &InstalledPlugin, app_version: &str, env: &PluginRuntimeEnv) -> Result<Child, String> {
+async fn spawn_plugin_child(
+    plugin: &InstalledPlugin,
+    app_version: &str,
+    env: &PluginRuntimeEnv,
+) -> Result<crate::process::ManagedChild, String> {
     let executable_path =
         plugin.compatibility.backend_executable.as_ref().ok_or_else(|| {
             format!("Plugin '{}' does not provide a compatible backend executable", plugin.manifest.id)
@@ -1067,17 +1239,19 @@ fn spawn_plugin_child(plugin: &InstalledPlugin, app_version: &str, env: &PluginR
         .env("DBX_HOST_API_VERSION", SUPPORTED_PLUGIN_HOST_API_VERSION)
         .env("DBX_PLUGIN_PROTOCOL_VERSION", SUPPORTED_PLUGIN_PROTOCOL_VERSION.to_string());
     env.apply_to(&mut command);
-    command.spawn().map_err(|error| format!("Failed to start plugin '{}': {error}", plugin.manifest.id))
+    crate::process::spawn_managed_child(&mut command)
+        .await
+        .map_err(|error| format!("Failed to start plugin '{}': {error}", plugin.manifest.id))
 }
 
-fn ensure_executable_permission(path: &Path) -> Result<(), String> {
+fn ensure_executable_permission(_path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let mode = std::fs::metadata(path).map_err(|error| error.to_string())?.permissions().mode();
+        let mode = std::fs::metadata(_path).map_err(|error| error.to_string())?.permissions().mode();
         if mode & 0o111 == 0 {
-            return Err(format!("Plugin backend is not executable: {}", path.display()));
+            return Err(format!("Plugin backend is not executable: {}", _path.display()));
         }
     }
     Ok(())
@@ -1088,10 +1262,14 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        decode_response_value, read_limited_line, trim_ascii_whitespace, user_input_result, PluginSessionState,
-        PluginSidecarSession, PromptActivity, UserInputSpec, USER_INPUT_DEFAULT_TIMEOUT, USER_INPUT_MAX_OPTIONS,
-        USER_INPUT_MAX_TIMEOUT, USER_INPUT_MIN_TIMEOUT,
+        decode_response_value, read_limited_line, trim_ascii_whitespace, user_input_result, PromptActivity,
+        UserInputSpec, USER_INPUT_DEFAULT_TIMEOUT, USER_INPUT_MAX_OPTIONS, USER_INPUT_MAX_TIMEOUT,
+        USER_INPUT_MIN_TIMEOUT,
     };
+    use super::{plugin_stderr_hint, PLUGIN_JAVA_TOO_OLD_MESSAGE};
+    #[cfg(unix)]
+    use super::{PluginSessionState, PluginSidecarSession};
+    #[cfg(unix)]
     use crate::plugins::{InstalledPlugin, PluginManifest, PluginRuntimeEnv};
     use tokio::io::BufReader;
 
@@ -1302,7 +1480,7 @@ sleep 30
             .invoke("sample/echo", serde_json::Value::Null)
             .await
             .expect("host should answer every plugin-initiated request");
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
 
         // A headless host (tests, MCP) must refuse instead of hanging the
         // plugin until the prompt timeout expires.
@@ -1327,7 +1505,7 @@ sleep 30
             .invoke("sample/echo", serde_json::Value::Null)
             .await
             .expect("host should answer every plugin-initiated request");
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         ssh_prompt::clear_ssh_prompt_gateway();
 
         let prompt = echoed_answer(&echoed, "prompt-1");
@@ -1359,7 +1537,7 @@ sleep 30
             .invoke("sample/echo", serde_json::Value::Null)
             .await
             .expect("host should answer every plugin-initiated request");
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         ssh_prompt::clear_ssh_prompt_gateway();
 
         let prompt = echoed_answer(&echoed, "prompt-1");
@@ -1386,7 +1564,7 @@ sleep 30
             .invoke_with_timeout("sample/echo", serde_json::Value::Null, None, Some(Duration::from_millis(300)))
             .await
             .expect("a prompt must pause the request deadline instead of failing it");
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         ssh_prompt::clear_ssh_prompt_gateway();
 
         assert_eq!(echoed_answer(&echoed, "prompt-1")["result"]["value"], "123456");
@@ -1413,7 +1591,7 @@ sleep 30
         assert_eq!(request.kind, dbx_platform::ssh_prompt::SshPromptKind::UserInput);
         assert!(!responder.is_closed());
 
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         ssh_prompt::clear_ssh_prompt_gateway();
 
         // The request fails (the session is gone) and the prompt's responder is
@@ -1447,7 +1625,7 @@ sleep 30
         assert!(!second_responder.is_closed());
         assert_eq!(session.prompts.state.borrow().open, 2);
 
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         let (first_answer, second_answer) =
             tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(first, second) })
                 .await
@@ -1512,7 +1690,7 @@ sleep 30
             assert!(result.unwrap_err().contains("timed out after 30 seconds"));
         }
         tokio::time::resume();
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
     }
 
     #[cfg(unix)]
@@ -1534,7 +1712,7 @@ sleep 30
         assert_eq!(first.await.unwrap(), serde_json::json!({ "ok": true }));
         assert!(second.await.unwrap_err().contains("response channel closed"));
         session.prompts.end();
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
     }
 
     #[test]
@@ -1681,7 +1859,7 @@ sleep 30
         let event = events.recv().await.unwrap();
         assert_eq!(event.method, "sample/progress");
         assert_eq!(event.params["value"], 50);
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         assert_eq!(session.status().state, PluginSessionState::Stopped);
     }
 
@@ -1730,7 +1908,7 @@ sleep 30
         let plugin = InstalledPlugin::new(manifest, dir.path().to_path_buf(), "0.5.67");
         let error = match PluginSidecarSession::start(plugin, "0.5.67", PluginRuntimeEnv::default()).await {
             Ok(session) => {
-                session.shutdown().await;
+                session.shutdown().await.unwrap();
                 panic!("mismatched backend identity should fail initialization")
             }
             Err(error) => error,
@@ -1779,7 +1957,62 @@ sleep 30
         let session = PluginSidecarSession::start(plugin, "0.5.67", PluginRuntimeEnv::default()).await.unwrap();
         let result: serde_json::Value = session.invoke("ping", serde_json::Value::Null).await.unwrap();
         assert_eq!(result["ok"], true);
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
+    }
+
+    /// The JDBC plugin is a legacy sidecar: started by Java 8 it dies on its
+    /// first request, and that error must name the Java version as the cause.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_runtime_explains_a_java_class_version_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("plugin.sh");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+echo 'Exception in thread "main" java.lang.UnsupportedClassVersionError: app/dbx/jdbc/Main has been compiled by a more recent version of the Java Runtime (class file version 65.0), this version of the Java Runtime only recognizes class file versions up to 52.0' >&2
+exit 1
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "name": "Legacy",
+            "executable": "plugin.sh"
+        }))
+        .unwrap();
+        let plugin = InstalledPlugin::new(manifest, dir.path().to_path_buf(), "0.5.67");
+        // The process may already be gone when `start` returns, so either step can fail.
+        let error = match PluginSidecarSession::start(plugin, "0.5.67", PluginRuntimeEnv::default()).await {
+            Ok(session) => {
+                let error = session.invoke::<serde_json::Value>("ping", serde_json::Value::Null).await.unwrap_err();
+                let _ = session.shutdown().await;
+                error
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.starts_with(PLUGIN_JAVA_TOO_OLD_MESSAGE), "unexpected error: {error}");
+        assert!(error.contains("UnsupportedClassVersionError"));
+    }
+
+    #[test]
+    fn stderr_hint_recognizes_java_class_version_failures() {
+        assert_eq!(
+            plugin_stderr_hint("java.lang.UnsupportedClassVersionError: app/dbx/jdbc/Main"),
+            Some(PLUGIN_JAVA_TOO_OLD_MESSAGE)
+        );
+        assert_eq!(
+            plugin_stderr_hint("this version of the Java Runtime only recognizes class file versions up to 52.0"),
+            Some(PLUGIN_JAVA_TOO_OLD_MESSAGE)
+        );
+        assert_eq!(plugin_stderr_hint("java.net.ConnectException: Connection refused"), None);
     }
 
     /// A legacy `stdio-jsonl` plugin answers with one line per response, so a whole
@@ -1823,7 +2056,7 @@ sleep 30
             .await
             .expect("a 12 MB legacy JSONL response must be read instead of failing the query");
         assert_eq!(result["page"].as_str().map(str::len), Some(12_000_000));
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
     }
 
     #[cfg(unix)]

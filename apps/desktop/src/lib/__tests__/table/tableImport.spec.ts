@@ -4,12 +4,16 @@ import {
   buildTableImportParseOptions,
   defaultTableImportEmptyStringAsNull,
   formatTableImportElapsed,
+  formatTableImportPreviewCell,
   importDataTypeForDatabase,
   nextTableImportWizardStep,
   previousTableImportWizardStep,
+  previewValueForGenerator,
   requiredImportTargetColumns,
   resolveTableImportElapsed,
+  suggestDataTypeForGenerator,
   suggestImportTargetDataTypes,
+  TABLE_IMPORT_GENERATOR_OPTIONS,
   tableImportProgressPercent,
   validateImportMappings,
 } from "@/lib/table/tableImport";
@@ -70,6 +74,12 @@ describe("tableImport", () => {
     expect(formatTableImportElapsed(61_000)).toBe("1m 1s");
   });
 
+  it("shows SQL current timestamp markers without exposing internal JSON", () => {
+    expect(formatTableImportPreviewCell({ $dbxSqlImportExpression: "currentTimestamp" })).toBe("CURRENT_TIMESTAMP");
+    expect(formatTableImportPreviewCell({ $dbxSqlImportExpression: "other" })).toBe('{"$dbxSqlImportExpression":"other"}');
+    expect(formatTableImportPreviewCell({ value: 1 })).toBe('{"value":1}');
+  });
+
   it("uses the backend elapsed time as the terminal source of truth", () => {
     expect(resolveTableImportElapsed(1_500, 1_000, false)).toBe(1_500);
     expect(resolveTableImportElapsed(1_500, 2_000, false)).toBe(2_000);
@@ -93,6 +103,31 @@ describe("tableImport", () => {
       "user name": "user_name",
       ignored: "",
     });
+  });
+
+  it("maps headerless columns by position even when generated names match a different target", () => {
+    expect(autoMapImportColumns(["column_1", "column_2"], ["column_2", "column_1"], "position")).toEqual({ column_1: "column_2", column_2: "column_1" });
+  });
+
+  it("falls back to position mapping in auto mode when no column names match", () => {
+    expect(autoMapImportColumns(["col_a", "col_b", "col_c"], ["id", "name"])).toEqual({
+      col_a: "id",
+      col_b: "name",
+      col_c: "",
+    });
+  });
+
+  it("keeps name-only matches when explicitly using name mode", () => {
+    expect(autoMapImportColumns(["col_a", "col_b"], ["id", "name"], "name")).toEqual({
+      col_a: "",
+      col_b: "",
+    });
+  });
+
+  it("skips excess source columns and leaves excess target columns unmapped", () => {
+    expect(autoMapImportColumns(["column_1", "column_2", "column_3"], ["id", "name"], "position")).toEqual({ column_1: "id", column_2: "name", column_3: "" });
+    expect(autoMapImportColumns(["column_1"], ["id", "name"], "position")).toEqual({ column_1: "id" });
+    expect(autoMapImportColumns(["column_1"], [], "position")).toEqual({ column_1: "" });
   });
 
   it("rejects empty mappings and duplicate target columns", () => {
@@ -205,5 +240,31 @@ describe("tableImport", () => {
     expect(importDataTypeForDatabase("decimal", "postgres")).toBe("DOUBLE PRECISION");
     expect(importDataTypeForDatabase("decimal", "sqlite")).toBe("REAL");
     expect(importDataTypeForDatabase("decimal", "oracle")).toBe("BINARY_DOUBLE");
+  });
+
+  it("supports auto-generator keys and previews", () => {
+    expect(TABLE_IMPORT_GENERATOR_OPTIONS.map((opt) => opt.value)).toEqual(["uuid", "uuid_simple", "current_timestamp", "current_date", "sequence"]);
+
+    expect(previewValueForGenerator("uuid")).toBe("<UUID>");
+    expect(previewValueForGenerator("uuid_simple")).toBe("<UUID32>");
+    expect(previewValueForGenerator("current_timestamp")).toBe("<NOW>");
+    expect(previewValueForGenerator("current_date")).toBe("<TODAY>");
+    expect(previewValueForGenerator("sequence", 1)).toBe("<SEQ:1>");
+    expect(previewValueForGenerator("sequence", 42)).toBe("<SEQ:42>");
+
+    expect(formatTableImportPreviewCell("original", "uuid", 0)).toBe("<UUID>");
+    expect(formatTableImportPreviewCell(null, "sequence", 2)).toBe("<SEQ:3>");
+  });
+
+  it("suggests data types for generators by database type", () => {
+    expect(suggestDataTypeForGenerator("uuid", "postgres")).toBe("UUID");
+    expect(suggestDataTypeForGenerator("uuid", "sqlserver")).toBe("UNIQUEIDENTIFIER");
+    expect(suggestDataTypeForGenerator("uuid", "mysql")).toBe("VARCHAR(36)");
+    expect(suggestDataTypeForGenerator("uuid_simple", "mysql")).toBe("VARCHAR(32)");
+    expect(suggestDataTypeForGenerator("current_timestamp", "mysql")).toBe("DATETIME");
+    expect(suggestDataTypeForGenerator("current_timestamp", "postgres")).toBe("TIMESTAMP");
+    expect(suggestDataTypeForGenerator("current_date", "postgres")).toBe("DATE");
+    expect(suggestDataTypeForGenerator("sequence", "mysql")).toBe("BIGINT");
+    expect(suggestDataTypeForGenerator("sequence", "sqlite")).toBe("INTEGER");
   });
 });

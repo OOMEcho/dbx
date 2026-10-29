@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { cn } from "@/lib/common/utils";
-import { floatingArrowOffset, floatingViewportShift } from "@/lib/common/floatingViewportPosition";
+import { floatingArrowOffset, floatingViewportShift, visibleTriggerRect } from "@/lib/common/floatingViewportPosition";
 
 const props = withDefaults(
   defineProps<{
@@ -133,7 +133,7 @@ function updatePosition() {
   const el = triggerElement();
   if (!el) return;
   arrowOffset.value = undefined;
-  const rect = el.getBoundingClientRect();
+  const rect = visibleTriggerRect(el);
   const offset = props.sideOffset;
   switch (props.side) {
     case "right":
@@ -306,7 +306,7 @@ watch(
     <div
       v-if="show"
       ref="tooltipRef"
-      class="fixed z-50 rounded-md text-xs"
+      class="fixed z-(--dbx-floating-layer-z-index) rounded-md text-xs"
       :class="cn([tooltipSurfaceClass, slots.content ? '' : ['inline-flex w-fit max-w-xs items-center gap-1.5 px-3 py-1.5', nowrap && !wrapNowrapContent ? 'whitespace-nowrap' : 'break-words'], tooltipTransformClass], contentClass)"
       :style="{ left: `${x}px`, top: `${y}px` }"
       role="tooltip"

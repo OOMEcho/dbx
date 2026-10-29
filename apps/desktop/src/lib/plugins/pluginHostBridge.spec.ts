@@ -1,7 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+// @vitest-environment happy-dom
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { reactive, readonly } from "vue";
 import { MAX_CONCURRENT_PLUGIN_DATA_QUERIES, PLUGIN_CLIPBOARD_AUDIT_CAPACITY, PluginHostBridge, clipboardReadGateAllows, createClipboardReadGate, pluginSandboxDocument, pluginSdkSource, recordClipboardRead } from "./pluginHostBridge";
 import type { InstalledPlugin, PluginResultViewContribution, PluginWorkbenchContribution } from "@/types/database";
+import type { PluginConnectionSummary } from "@/types/pluginConnection";
 
 function plugin(permissions: string[] = [], contributions: InstalledPlugin["manifest"]["contributions"] = []): InstalledPlugin {
   return {
@@ -17,7 +19,7 @@ describe("PluginHostBridge", () => {
   it("host.listConnections returns a read-only secret-free list scoped to the calling plugin", async () => {
     const messages: unknown[] = [];
     const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
-    const listConnections = vi.fn(() => [{ id: "conn-1", name: "Prod", providerId: "sample.connection", connectionType: "sample", readOnly: true }]);
+    const listConnections = vi.fn((_pluginId?: string, _options?: { all?: boolean }): PluginConnectionSummary[] => [{ id: "conn-1", name: "Prod", dbType: "sample", dialect: "sample", connected: true, isConnected: true, providerId: "sample.connection", connectionType: "sample", readOnly: true }]);
     const contributions = [
       { type: "connection-provider", id: "sample.connection", label: "Sample", database_type: "sample", fields: [] },
       { type: "workbench", id: "sample.main", label: "Sample" },
@@ -36,6 +38,96 @@ describe("PluginHostBridge", () => {
     } as MessageEvent);
     await vi.waitFor(() => expect(listConnections).toHaveBeenCalledWith("sample"));
     expect(messages[0]).toMatchObject({ source: "dbx-host", type: "response", id: "9", result: [{ id: "conn-1", name: "Prod", providerId: "sample.connection", readOnly: true }] });
+  });
+
+  it("host.getConnections and host.listConnections require host.connections:read for all connections", async () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const listAllConnections = vi.fn(() => [
+      { id: "conn-1", name: "MySQL Main", dbType: "mysql", dialect: "mysql", connected: true, isConnected: true, readOnly: false },
+      { id: "conn-2", name: "PG Replica", dbType: "postgres", dialect: "postgres", connected: false, isConnected: false, readOnly: true },
+    ]);
+    const bridge = new PluginHostBridge(plugin(["host.connections:read"]), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      listAllConnections,
+    });
+
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "10", method: "host.getConnections", params: {} },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(listAllConnections).toHaveBeenCalled());
+    expect(messages[0]).toMatchObject({
+      source: "dbx-host",
+      type: "response",
+      id: "10",
+      result: [
+        { id: "conn-1", name: "MySQL Main", dbType: "mysql", dialect: "mysql", connected: true, isConnected: true },
+        { id: "conn-2", name: "PG Replica", dbType: "postgres", dialect: "postgres", connected: false, isConnected: false },
+      ],
+    });
+
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "11", method: "host.listConnections", params: {} },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(messages.length).toBe(2));
+    expect(messages[1]).toMatchObject({
+      source: "dbx-host",
+      type: "response",
+      id: "11",
+      result: [
+        { id: "conn-1", name: "MySQL Main" },
+        { id: "conn-2", name: "PG Replica" },
+      ],
+    });
+  });
+
+  it("host.getConnections accepts host.connections::read alias", async () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const listAllConnections = vi.fn(() => [{ id: "c1", name: "Test", dbType: "sqlite", dialect: "sqlite", connected: true, isConnected: true, readOnly: false }]);
+    const bridge = new PluginHostBridge(plugin(["host.connections::read"]), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      listAllConnections,
+    });
+
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "alias-1", method: "host.getConnections", params: {} },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(listAllConnections).toHaveBeenCalled());
+    expect(messages[0]).toMatchObject({ source: "dbx-host", type: "response", id: "alias-1", result: [{ id: "c1", name: "Test" }] });
+  });
+
+  it("rejects host.getConnections when host.connections:read is not declared", async () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const bridge = new PluginHostBridge(plugin(["host.workbench"]), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      listAllConnections: vi.fn(),
+    });
+
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "err-1", method: "host.getConnections", params: {} },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(messages.length).toBe(1));
+    expect(messages[0]).toMatchObject({
+      source: "dbx-host",
+      type: "response",
+      id: "err-1",
+      error: expect.stringContaining("host.connections:read"),
+    });
   });
 
   it("streams downloads under the owning plugin, scopes cancellation and reports native capability", async () => {
@@ -435,6 +527,72 @@ describe("PluginHostBridge", () => {
     request("default", { contributionId: "sample.other" });
     await vi.waitFor(() => expect(messages).toHaveLength(2));
     expect(openWorkbench).toHaveBeenNthCalledWith(2, "sample", "sample.other", undefined, { forceNew: false });
+  });
+
+  it("rejects host.setTitle and host.getTitle without host.workbench permission", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const bridge = new PluginHostBridge(plugin(), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      setTitle: vi.fn(),
+      getTitle: vi.fn(),
+    });
+
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "t1", method: "host.setTitle", params: { title: "Custom Title" } },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(messages[0]).toMatchObject({ id: "t1", error: "Plugin has not declared permission 'host.workbench'" });
+
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "t2", method: "host.getTitle" },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(messages).toHaveLength(2));
+    expect(messages[1]).toMatchObject({ id: "t2", error: "Plugin has not declared permission 'host.workbench'" });
+  });
+
+  it("handles host.setTitle and host.getTitle with host.workbench permission", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const setTitle = vi.fn();
+    const getTitle = vi.fn(() => "Current Title");
+    const bridge = new PluginHostBridge(plugin(["host.workbench"]), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      setTitle,
+      getTitle,
+    });
+
+    const request = (id: string, method: string, params?: unknown) =>
+      bridge.handleWindowMessage({
+        source: target,
+        data: { source: "dbx-plugin", version: 1, type: "request", id, method, params },
+      } as MessageEvent);
+
+    request("set-1", "host.setTitle", { title: "  My Tab  " });
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(setTitle).toHaveBeenLastCalledWith("My Tab");
+    expect(messages[0]).toMatchObject({ id: "set-1", result: null });
+
+    request("set-2", "host.setTitle", { title: null });
+    await vi.waitFor(() => expect(messages).toHaveLength(2));
+    expect(setTitle).toHaveBeenLastCalledWith(null);
+
+    request("set-3", "host.setTitle", { title: "   " });
+    await vi.waitFor(() => expect(messages).toHaveLength(3));
+    expect(setTitle).toHaveBeenLastCalledWith(null);
+
+    request("get-1", "host.getTitle");
+    await vi.waitFor(() => expect(messages).toHaveLength(4));
+    expect(getTitle).toHaveBeenCalled();
+    expect(messages[3]).toMatchObject({ id: "get-1", result: "Current Title" });
   });
 
   it("routes host.executeCommand to the surface handler scoped to the calling plugin", async () => {
@@ -1032,18 +1190,24 @@ describe("PluginHostBridge", () => {
   });
 
   it("injects a <base> and widens resource CSP sources for the plugin asset origin", () => {
-    const document = pluginSandboxDocument("<html><head></head><body></body></html>", [], undefined, { baseUrl: "dbx-plugin://localhost/io.github.t8y2.s3/assets/" });
+    const document = pluginSandboxDocument('<html><head></head><body><script type="module" src="dbx-plugin://localhost/io.github.t8y2.s3/entry/app.mjs"></script><script type="module" src="https://cdn.example.test/app.mjs"></script></body></html>', [], undefined, {
+      baseUrl: "dbx-plugin://localhost/io.github.t8y2.s3/assets/",
+    });
     expect(document).toContain('<base href="dbx-plugin://localhost/io.github.t8y2.s3/assets/">');
     expect(document).toContain("script-src 'unsafe-inline' blob: dbx-plugin:;");
     expect(document).toContain("font-src data: blob: dbx-plugin:;");
+    expect(document).toContain('src="dbx-plugin://localhost/io.github.t8y2.s3/entry/app.mjs"');
+    const scriptPolicy = document.match(/script-src[^;]+;/)?.[0] ?? "";
+    expect(scriptPolicy).not.toContain("https://cdn.example.test");
     // <base> leads the head injection so inlined CSS url() resolves against it.
     expect(document.indexOf("<base ")).toBeLessThan(document.indexOf("<style>"));
   });
 
   it("allows the WebView2-mapped asset origin exactly", () => {
-    const document = pluginSandboxDocument("<html><head></head><body></body></html>", [], undefined, { baseUrl: "http://dbx-plugin.localhost/io.github.t8y2.s3/assets/" });
+    const document = pluginSandboxDocument('<html><head></head><body><script type="module" src="http://dbx-plugin.localhost/io.github.t8y2.s3/entry/app.mjs"></script></body></html>', [], undefined, { baseUrl: "http://dbx-plugin.localhost/io.github.t8y2.s3/assets/" });
     expect(document).toContain("script-src 'unsafe-inline' blob: http://dbx-plugin.localhost;");
     expect(document).toContain('<base href="http://dbx-plugin.localhost/io.github.t8y2.s3/assets/">');
+    expect(document).toContain('src="http://dbx-plugin.localhost/io.github.t8y2.s3/entry/app.mjs"');
   });
 
   it("rejects malformed asset base URLs without touching the CSP", () => {
@@ -1057,6 +1221,22 @@ describe("PluginHostBridge", () => {
     expect(document).toContain("script-src 'unsafe-inline' blob:;");
     expect(document).toContain("font-src data: blob:;");
     expect(document).not.toContain("<base ");
+  });
+
+  it("adds unsafe-eval to script-src only for the granted plugin", () => {
+    const granted = pluginSandboxDocument("<html><head></head><body></body></html>", [], undefined, {
+      baseUrl: "http://dbx-plugin.localhost/io.github.t8y2.s3/assets/",
+      allowUnsafeEval: true,
+    });
+    expect(granted).toContain("script-src 'unsafe-inline' 'unsafe-eval' blob: http://dbx-plugin.localhost;");
+    // The grant is scoped to script-src; no other directive picks it up.
+    expect(granted).toContain("style-src 'unsafe-inline' blob:;");
+    expect(granted).not.toContain("img-src data: blob: http://dbx-plugin.localhost 'unsafe-eval'");
+
+    const withheld = pluginSandboxDocument("<html><head></head><body></body></html>", [], undefined, {
+      baseUrl: "http://dbx-plugin.localhost/io.github.t8y2.s3/assets/",
+    });
+    expect(withheld).not.toContain("unsafe-eval");
   });
 
   it("pre-seeds the current theme as the sandbox first paint", () => {
@@ -1645,15 +1825,37 @@ describe("PluginHostBridge", () => {
 describe("plugin SDK source", () => {
   interface SdkWindow {
     dbxPlugin?: {
+      ready: Promise<unknown>;
+      contributionId?: string;
+      context?: Record<string, unknown>;
+      onInit: (listener: (context: unknown) => void) => () => void;
       invoke: (method: string, params?: unknown, options?: { timeoutMs?: number }) => Promise<unknown>;
       getPlanCapabilities: (connectionId: string) => Promise<unknown>;
       explainPlan: (request: unknown) => Promise<unknown>;
       getTableMetadata: (context: unknown) => Promise<unknown>;
+      setTitle: (title: string | null) => Promise<unknown>;
+      getTitle: () => Promise<unknown>;
+      workbench: {
+        setTitle: (title: string | null) => Promise<unknown>;
+        getTitle: () => Promise<unknown>;
+      };
+      fileTransfer: {
+        onDragState: (listener: (active: boolean, position?: { x: number; y: number }) => void) => () => void;
+        onDrop: (listener: (files: unknown[], drop: unknown) => void) => () => void;
+      };
+      onLayout: (listener: (event: unknown) => void) => () => void;
     };
+    dispatchEvent: ReturnType<typeof vi.fn>;
+    document: {
+      dispatchEvent: ReturnType<typeof vi.fn>;
+    };
+    receiveHostMessage: (message: unknown) => void;
   }
 
   function loadSdk(posted: unknown[], initialTheme?: { appearance: "dark" | "light"; tokens: Record<string, string> }): SdkWindow {
-    const sandbox = {} as SdkWindow;
+    const sandbox = {
+      dispatchEvent: vi.fn(),
+    } as unknown as SdkWindow;
     const document = {
       documentElement: {
         dataset: {} as Record<string, string>,
@@ -1661,10 +1863,20 @@ describe("plugin SDK source", () => {
       },
       dispatchEvent: vi.fn(),
     } as unknown as Document;
+    sandbox.document = document as unknown as SdkWindow["document"];
+    let onMessage: ((event: MessageEvent) => void) | undefined;
+    const parent = { postMessage: (message: unknown) => posted.push(message) };
+    const addEventListener = (type: string, listener: (event: MessageEvent) => void) => {
+      if (type === "message") onMessage = listener;
+    };
     // The SDK IIFE only touches window and the bare-global addEventListener at
     // boot; parent.postMessage is captured for later request() calls, so a
     // stub window/parent is enough here.
-    new Function("window", "parent", "addEventListener", "document", pluginSdkSource(initialTheme))(sandbox, { postMessage: (message: unknown) => posted.push(message) }, () => {}, document);
+    new Function("window", "parent", "addEventListener", "document", pluginSdkSource(initialTheme))(sandbox, parent, addEventListener, document);
+    sandbox.receiveHostMessage = (message) => {
+      if (!onMessage) throw new Error("SDK did not register its host-message listener");
+      onMessage({ source: parent, data: message } as unknown as MessageEvent);
+    };
     return sandbox;
   }
 
@@ -1702,6 +1914,51 @@ describe("plugin SDK source", () => {
 
     expect(dbxPlugin).toBeDefined();
     expect(posted[0]).toMatchObject({ source: "dbx-plugin", type: "ready" });
+  });
+
+  it("exposes the opened contribution after ready when init was already delivered and context is empty", async () => {
+    const sdkMessages: unknown[] = [];
+    const hostMessages: unknown[] = [];
+    const sdk = loadSdk(sdkMessages);
+    const probe: PluginWorkbenchContribution = { type: "workbench", id: "sample.probe", label: "Probe" };
+    const generation: PluginWorkbenchContribution = { type: "workbench", id: "sample.generation", label: "Generation" };
+    const target = { postMessage: (message: unknown) => hostMessages.push(message) } as unknown as Window;
+    const bridge = new PluginHostBridge(plugin([], [probe, generation]), generation, {}, () => target, { invoke: vi.fn(), notify: vi.fn(), sendBinary: vi.fn(), readAsset: vi.fn() });
+
+    bridge.sendInit();
+    const init = hostMessages[0] as Record<string, unknown>;
+    expect(init).toMatchObject({ type: "init", contributionId: "sample.generation", context: {} });
+    sdk.receiveHostMessage(init);
+
+    await sdk.dbxPlugin!.ready;
+
+    expect(sdk.dbxPlugin!.contributionId).toBe("sample.generation");
+    expect(sdk.dbxPlugin!.contributionId).not.toBe(probe.id);
+    expect(sdk.dbxPlugin!.context).toEqual({});
+    const lateInit = vi.fn();
+    sdk.dbxPlugin!.onInit(lateInit);
+    expect(lateInit).toHaveBeenCalledWith({});
+  });
+
+  it("sets contribution identity independently of table context before ready and onInit", async () => {
+    const sdk = loadSdk([]);
+    const hostMessages: unknown[] = [];
+    const tableContext = { connectionId: "connection-1", database: "app", schema: "public", table: "orders" };
+    const generation: PluginWorkbenchContribution = { type: "workbench", id: "sample.generation", label: "Generation" };
+    const target = { postMessage: (message: unknown) => hostMessages.push(message) } as unknown as Window;
+    const bridge = new PluginHostBridge(plugin([], [generation]), generation, tableContext, () => target, { invoke: vi.fn(), notify: vi.fn(), sendBinary: vi.fn(), readAsset: vi.fn() });
+    let observed: { context: unknown; contributionId?: string } | undefined;
+    sdk.dbxPlugin!.onInit((context) => {
+      observed = { context, contributionId: sdk.dbxPlugin!.contributionId };
+    });
+
+    bridge.sendInit();
+    sdk.receiveHostMessage(hostMessages[0]);
+    await sdk.dbxPlugin!.ready;
+
+    expect(observed).toEqual({ context: tableContext, contributionId: "sample.generation" });
+    expect(sdk.dbxPlugin!.context).toEqual(tableContext);
+    expect(sdk.dbxPlugin!.contributionId).toBe("sample.generation");
   });
 
   it("keeps cloneable values intact and plain scalars by reference", () => {
@@ -1745,6 +2002,29 @@ describe("plugin SDK source", () => {
     const request = firstRequest(posted);
     expect(request.method).toBe("host.getTableMetadata");
     expect(request.params).toEqual({ connectionId: "c1", database: "app", table: "users" });
+  });
+
+  it("exposes setTitle and getTitle on window.dbxPlugin and window.dbxPlugin.workbench", () => {
+    const posted: unknown[] = [];
+    const { dbxPlugin } = loadSdk(posted);
+
+    void dbxPlugin!.setTitle("New Tab Name");
+    void dbxPlugin!.getTitle();
+    void dbxPlugin!.workbench.setTitle(null);
+    void dbxPlugin!.workbench.getTitle();
+
+    const requests = posted.filter((message) => (message as { type: string }).type === "request") as {
+      method: string;
+      params: Record<string, unknown>;
+    }[];
+
+    expect(requests).toHaveLength(4);
+    expect(requests[0].method).toBe("host.setTitle");
+    expect(requests[0].params).toEqual({ title: "New Tab Name" });
+    expect(requests[1].method).toBe("host.getTitle");
+    expect(requests[2].method).toBe("host.setTitle");
+    expect(requests[2].params).toEqual({ title: null });
+    expect(requests[3].method).toBe("host.getTitle");
   });
 
   it("forwards fileTransfer requests to the host api", async () => {
@@ -1800,11 +2080,95 @@ describe("plugin SDK source", () => {
     const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
     const bridge = new PluginHostBridge(plugin(), workbench, {}, () => target, { invoke: vi.fn(), notify: vi.fn(), sendBinary: vi.fn(), readAsset: vi.fn() });
 
-    bridge.forwardDragState(true);
-    bridge.forwardFileDrop([{ handleId: "t1", name: "a.txt", size: 1, contentType: "text/plain" }]);
+    bridge.forwardDragState(true, { x: 15, y: 25 });
+    bridge.forwardFileDrop([{ handleId: "t1", name: "a.txt", size: 1, contentType: "text/plain" }], { dropId: "d1", truncated: false, position: { x: 15, y: 25 } });
 
-    expect(messages[0]).toMatchObject({ source: "dbx-host", version: 1, type: "dragstate", active: true });
-    expect(messages[1]).toMatchObject({ source: "dbx-host", version: 1, type: "filedrop", files: [{ handleId: "t1", name: "a.txt" }] });
+    expect(messages[0]).toMatchObject({ source: "dbx-host", version: 1, type: "dragstate", active: true, position: { x: 15, y: 25 } });
+    expect(messages[1]).toMatchObject({ source: "dbx-host", version: 1, type: "filedrop", files: [{ handleId: "t1", name: "a.txt" }], position: { x: 15, y: 25 } });
+  });
+
+  it("sdk delivers drag coordinates and drop position to listeners while keeping dbx-plugin-dragstate boolean", () => {
+    const posted: unknown[] = [];
+    const sdkWindow = loadSdk(posted);
+    const { dbxPlugin } = sdkWindow;
+    expect(dbxPlugin).toBeDefined();
+
+    const dragEvents: Array<{ active: boolean; position?: { x: number; y: number } }> = [];
+    const dropEvents: Array<{ files: unknown[]; drop: unknown }> = [];
+
+    dbxPlugin!.fileTransfer.onDragState((active, position) => {
+      dragEvents.push({ active, position });
+    });
+    dbxPlugin!.fileTransfer.onDrop((files, drop) => {
+      dropEvents.push({ files, drop });
+    });
+
+    // 1. Drag enter with position
+    sdkWindow.receiveHostMessage({
+      source: "dbx-host",
+      version: 1,
+      type: "dragstate",
+      active: true,
+      position: { x: 100, y: 200 },
+    });
+    expect(dragEvents).toEqual([{ active: true, position: { x: 100, y: 200 } }]);
+    expect(sdkWindow.document.dispatchEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "dbx-plugin-dragstate",
+        detail: true,
+      }),
+    );
+
+    // 2. Drag over with updated position
+    sdkWindow.receiveHostMessage({
+      source: "dbx-host",
+      version: 1,
+      type: "dragstate",
+      active: true,
+      position: { x: 150, y: 250 },
+    });
+    expect(dragEvents[1]).toEqual({ active: true, position: { x: 150, y: 250 } });
+
+    // 3. Drop with position
+    sdkWindow.receiveHostMessage({
+      source: "dbx-host",
+      version: 1,
+      type: "filedrop",
+      files: [{ handleId: "h1", name: "test.txt", size: 10 }],
+      dropId: "drop-1",
+      truncated: false,
+      position: { x: 150, y: 250 },
+    });
+    expect(dropEvents).toEqual([
+      {
+        files: [{ handleId: "h1", name: "test.txt", size: 10 }],
+        drop: { dropId: "drop-1", truncated: false, position: { x: 150, y: 250 } },
+      },
+    ]);
+    expect(sdkWindow.document.dispatchEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "dbx-plugin-filedrop",
+        detail: {
+          files: [{ handleId: "h1", name: "test.txt", size: 10 }],
+          drop: { dropId: "drop-1", truncated: false, position: { x: 150, y: 250 } },
+        },
+      }),
+    );
+
+    // 4. Drag leave without position
+    sdkWindow.receiveHostMessage({
+      source: "dbx-host",
+      version: 1,
+      type: "dragstate",
+      active: false,
+    });
+    expect(dragEvents[2]).toEqual({ active: false, position: undefined });
+    expect(sdkWindow.document.dispatchEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "dbx-plugin-dragstate",
+        detail: false,
+      }),
+    );
   });
 
   it("sdk exposes the fileTransfer namespace and drop listeners", () => {
@@ -1862,6 +2226,39 @@ describe("plugin SDK source", () => {
     await expect(bridge.requestWorkbenchClose(5000)).resolves.toBe(false);
     expect(messages.some((message) => message.type === "workbench/close")).toBe(true);
   });
+
+  it("notifies the plugin of layout recalculations and dispatches window resize inside SDK", () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const bridge = new PluginHostBridge(plugin(), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+    });
+
+    bridge.notifyLayout();
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toEqual({
+      source: "dbx-host",
+      version: 1,
+      type: "layout",
+    });
+
+    const posted: unknown[] = [];
+    const sdk = loadSdk(posted);
+    let sdkListenerFired = false;
+
+    sdk.dbxPlugin!.onLayout(() => {
+      sdkListenerFired = true;
+    });
+
+    sdk.receiveHostMessage(messages[0]);
+
+    expect(sdk.dispatchEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "resize" }));
+    expect(sdk.document.dispatchEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "dbx-plugin-layout" }));
+    expect(sdkListenerFired).toBe(true);
+  });
 });
 
 describe("AI completion bridge", () => {
@@ -1884,5 +2281,264 @@ describe("AI completion bridge", () => {
     expect(api.generateAiText).not.toHaveBeenCalled();
     expect((await request("host.ai.generateText", { pluginName: "forged", configId: "one", model: "a", prompt: "hi" })).result).toBe("fix: example");
     expect(api.generateAiText).toHaveBeenCalledWith("Sample", { configId: "one", model: "a", prompt: "hi" });
+  });
+  it("validates the host-owned task enum and forwards known presets only", async () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const generateAiText = vi.fn().mockResolvedValue("ls -la");
+    const bridge = new PluginHostBridge(plugin(["host.ai"]), workbench, {}, () => target, { invoke: vi.fn(), notify: vi.fn(), sendBinary: vi.fn(), readAsset: vi.fn(), generateAiText });
+    const request = async (params: unknown) => {
+      const count = messages.length;
+      bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id: String(count), method: "host.ai.generateText", params } } as MessageEvent);
+      await vi.waitFor(() => expect(messages.length).toBe(count + 1));
+      return messages[count];
+    };
+    expect((await request({ configId: "one", model: "a", prompt: "hi", task: "system prompt injection" })).error).toContain("Invalid AI task");
+    expect(generateAiText).not.toHaveBeenCalled();
+    expect((await request({ configId: "one", model: "a", prompt: "hi", task: 42 })).error).toContain("Invalid AI task");
+    expect((await request({ configId: "one", model: "a", prompt: "hi", task: "command-generation" })).result).toBe("ls -la");
+    expect(generateAiText).toHaveBeenCalledWith("Sample", { configId: "one", model: "a", prompt: "hi", task: "command-generation" });
+    // Absent/null task keeps the exact legacy call shape.
+    generateAiText.mockClear();
+    expect((await request({ configId: "one", model: "a", prompt: "hi" })).result).toBe("ls -la");
+    expect(generateAiText).toHaveBeenCalledWith("Sample", { configId: "one", model: "a", prompt: "hi" });
+    expect((await request({ configId: "one", model: "a", prompt: "hi", task: null })).result).toBe("ls -la");
+    expect(generateAiText).toHaveBeenLastCalledWith("Sample", { configId: "one", model: "a", prompt: "hi" });
+  });
+  it("streams generations as requestId-scoped chunk events and resolves with the full text", async () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    let pushChunk!: (delta: string, done: boolean) => void;
+    let settle!: () => void;
+    const generateAiTextStream = vi.fn((_pluginName: string, _request: unknown, onChunk: (chunk: { delta: string; done: boolean }) => void) => {
+      pushChunk = (delta, done) => onChunk({ delta, done });
+      return new Promise<string>((resolve) => {
+        settle = () => resolve("ls -la");
+      });
+    });
+    const bridge = new PluginHostBridge(plugin(["host.ai"]), workbench, {}, () => target, { invoke: vi.fn(), notify: vi.fn(), sendBinary: vi.fn(), readAsset: vi.fn(), generateAiTextStream, cancelAiGeneration: vi.fn().mockResolvedValue(true) });
+    const send = (id: string, method: string, params: unknown) => bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id, method, params } } as MessageEvent);
+    const waitResponse = async (id: string) => {
+      await vi.waitFor(() => expect(messages.some((message) => message.type === "response" && message.id === id)).toBe(true));
+      return messages.find((message) => message.type === "response" && message.id === id);
+    };
+    bridge.sendInit();
+    expect(messages[0].capabilities.aiCompletionStream).toBe(true);
+    send("open", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "list files", requestId: "gen-1", task: "command-generation" });
+    await vi.waitFor(() => expect(generateAiTextStream).toHaveBeenCalledOnce());
+    expect(generateAiTextStream.mock.calls[0][0]).toBe("Sample");
+    expect(generateAiTextStream.mock.calls[0][1]).toMatchObject({ configId: "one", model: "a", prompt: "list files", requestId: "gen-1", task: "command-generation" });
+    pushChunk("ls ", false);
+    pushChunk("-la", false);
+    await vi.waitFor(() => expect(messages.filter((message) => message.type === "event" && message.method === "host.ai.generationChunk")).toHaveLength(2));
+    expect(messages.filter((message) => message.method === "host.ai.generationChunk").map((message) => message.params)).toEqual([
+      { requestId: "gen-1", delta: "ls ", done: false },
+      { requestId: "gen-1", delta: "-la", done: false },
+    ]);
+    send("cancel", "host.ai.cancelGeneration", { requestId: "gen-1" });
+    await waitResponse("cancel");
+    expect(messages.find((message) => message.id === "cancel").result).toEqual({ cancelled: true });
+    // The completion emits the final done chunk before its promise resolves.
+    pushChunk("", true);
+    settle();
+    expect((await waitResponse("open")).result).toBe("ls -la");
+    // A finished stream is no longer cancellable and unknown ids answer false.
+    send("late", "host.ai.cancelGeneration", { requestId: "gen-1" });
+    await waitResponse("late");
+    expect(messages.find((message) => message.id === "late").result).toEqual({ cancelled: false });
+  });
+  it("gates streaming, validates requestId and task, and keeps the capability honest", async () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const baseApi = () => ({ invoke: vi.fn(), notify: vi.fn(), sendBinary: vi.fn(), readAsset: vi.fn() });
+    const generateAiTextStream = vi.fn().mockResolvedValue("done");
+    const cancelAiGeneration = vi.fn().mockResolvedValue(true);
+    // Without both stream and cancel the capability stays off and the call is refused.
+    let bridge = new PluginHostBridge(plugin(["host.ai"]), workbench, {}, () => target, { ...baseApi(), generateAiTextStream });
+    const send = (b: PluginHostBridge, id: string, method: string, params: unknown) => b.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id, method, params } } as MessageEvent);
+    const waitResponse = async (id: string) => {
+      await vi.waitFor(() => expect(messages.some((message) => message.type === "response" && message.id === id)).toBe(true));
+      return messages.find((message) => message.type === "response" && message.id === id);
+    };
+    bridge.sendInit();
+    expect(messages[messages.length - 1].capabilities.aiCompletionStream).toBe(false);
+    send(bridge, "half", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "hi", requestId: "gen-0" });
+    expect((await waitResponse("half")).error).toContain("unavailable");
+    // With both methods the capability is advertised, but permission, requestId
+    // and the task enum are still enforced.
+    bridge = new PluginHostBridge(plugin([]), workbench, {}, () => target, { ...baseApi(), generateAiTextStream, cancelAiGeneration });
+    send(bridge, "gate", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "hi", requestId: "gen-1" });
+    expect((await waitResponse("gate")).error).toContain("host.ai");
+    bridge = new PluginHostBridge(plugin(["host.ai"]), workbench, {}, () => target, { ...baseApi(), generateAiTextStream, cancelAiGeneration });
+    send(bridge, "missing-id", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "hi" });
+    expect((await waitResponse("missing-id")).error).toContain("AI requestId");
+    send(bridge, "bad-task", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "hi", requestId: "gen-2", task: "injected" });
+    expect((await waitResponse("bad-task")).error).toContain("Invalid AI task");
+    send(bridge, "ok", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "hi", requestId: "gen-2" });
+    expect((await waitResponse("ok")).result).toBe("done");
+    expect(generateAiTextStream).toHaveBeenCalledOnce();
+    expect(generateAiTextStream.mock.calls[0][1]).toMatchObject({ requestId: "gen-2" });
+  });
+  it("cancels only its own active streams and stops forwarding after cancellation", async () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    let pushChunk!: (delta: string, done: boolean) => void;
+    const generateAiTextStream = vi.fn((_pluginName: string, _request: unknown, onChunk: (chunk: { delta: string; done: boolean }) => void) => {
+      pushChunk = (delta, done) => onChunk({ delta, done });
+      return new Promise<string>(() => undefined);
+    });
+    const cancelAiGeneration = vi.fn().mockResolvedValue(true);
+    const bridge = new PluginHostBridge(plugin(["host.ai"]), workbench, {}, () => target, { invoke: vi.fn(), notify: vi.fn(), sendBinary: vi.fn(), readAsset: vi.fn(), generateAiTextStream, cancelAiGeneration });
+    const send = (id: string, method: string, params: unknown) => bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id, method, params } } as MessageEvent);
+    const waitResponse = async (id: string) => {
+      await vi.waitFor(() => expect(messages.some((message) => message.type === "response" && message.id === id)).toBe(true));
+      return messages.find((message) => message.type === "response" && message.id === id);
+    };
+    send("open", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "hi", requestId: "gen-1" });
+    await vi.waitFor(() => expect(generateAiTextStream).toHaveBeenCalledOnce());
+    // A request from another workbench (never registered here) cannot cancel.
+    send("foreign", "host.ai.cancelGeneration", { requestId: "someone-else" });
+    await waitResponse("foreign");
+    expect(cancelAiGeneration).not.toHaveBeenCalled();
+    expect(messages.find((message) => message.id === "foreign").result).toEqual({ cancelled: false });
+    send("cancel", "host.ai.cancelGeneration", { requestId: "gen-1" });
+    await waitResponse("cancel");
+    expect(cancelAiGeneration).toHaveBeenCalledWith("gen-1");
+    expect(messages.find((message) => message.id === "cancel").result).toEqual({ cancelled: true });
+    // Chunks after cancellation are no longer forwarded.
+    pushChunk("late", false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(messages.some((message) => message.method === "host.ai.generationChunk" && message.params.delta === "late")).toBe(false);
+  });
+  it("cancels active streams when the workbench is disposed", async () => {
+    const target = { postMessage: vi.fn() } as unknown as Window;
+    const cancelAiGeneration = vi.fn().mockResolvedValue(true);
+    const bridge = new PluginHostBridge(plugin(["host.ai"]), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      generateAiTextStream: vi.fn(() => new Promise<string>(() => undefined)),
+      cancelAiGeneration,
+    });
+    bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id: "open", method: "host.ai.generateTextStream", params: { configId: "one", model: "a", prompt: "hi", requestId: "gen-1" } } } as MessageEvent);
+    await vi.waitFor(() => expect(cancelAiGeneration.mock.calls.length).toBeGreaterThanOrEqual(0));
+    bridge.dispose();
+    expect(cancelAiGeneration).toHaveBeenCalledWith("gen-1");
+  });
+
+  it("exposes connection enumeration in the sandbox SDK and advertises connectionsApi capability", () => {
+    const source = pluginSdkSource();
+    expect(source).toContain("getConnections: () => request('host.getConnections', {})");
+    expect(source).toContain("listConnections: (options) => request('host.listConnections', options || {})");
+    expect(source).toContain("connections: Object.freeze({");
+
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const bridge = new PluginHostBridge(plugin(["host.connections:read"]), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      listAllConnections: vi.fn(() => []),
+    });
+    bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "ready" } } as MessageEvent);
+    expect(messages.some((m) => m.type === "init" && m.capabilities?.connectionsApi === true)).toBe(true);
+  });
+});
+
+// The plugin-side close shortcut has to cooperate with whatever the plugin's
+// focused control already did with the key. A terminal (xterm) turns Ctrl+W
+// into a control byte and claims the event; while the host registered its
+// listener in the CAPTURE phase it closed the tab before the terminal ever saw
+// the key. These tests boot the real injected SDK inside the DOM and dispatch a
+// bubbling keydown on a descendant node, because only real event propagation
+// shows the capture/bubble difference: a capture-phase listener runs before the
+// terminal textarea, a bubble-phase listener after it.
+describe("plugin close-tab shortcut vs. terminal key handling", () => {
+  const posted: unknown[] = [];
+  let booted = false;
+
+  // Boot once: every boot registers another window keydown listener, and stale
+  // listeners would answer the next test's keystrokes.
+  function bootSdk(): void {
+    if (booted) return;
+    booted = true;
+    const parent = { postMessage: (message: unknown) => posted.push(message) };
+    new Function("window", "parent", "addEventListener", "document", pluginSdkSource())(window, parent, window.addEventListener.bind(window), document);
+  }
+
+  function shortcuts(): Array<{ source?: string; type?: string; shortcut?: string }> {
+    return posted.filter((message) => (message as { type?: string }).type === "shortcut") as Array<{ source?: string; type?: string; shortcut?: string }>;
+  }
+
+  function mountTerminal(consume?: (event: { preventDefault: () => void; stopPropagation: () => void }) => void): HTMLTextAreaElement {
+    const container = document.createElement("div");
+    const textarea = document.createElement("textarea");
+    container.appendChild(textarea);
+    document.body.appendChild(container);
+    if (consume) textarea.addEventListener("keydown", consume);
+    return textarea;
+  }
+
+  function press(target: EventTarget, init: KeyboardEventInit, overrides?: Record<string, unknown>): KeyboardEvent {
+    const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
+    for (const [name, value] of Object.entries(overrides || {})) Object.defineProperty(event, name, { value, configurable: true });
+    target.dispatchEvent(event);
+    return event;
+  }
+
+  beforeEach(() => {
+    bootSdk();
+    posted.length = 0;
+  });
+
+  it("keeps the tab open when the focused terminal consumes Ctrl+W", () => {
+    // xterm's shape: claim the key so the browser and the host both back off.
+    const textarea = mountTerminal((event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+
+    const event = press(textarea, { key: "w", ctrlKey: true });
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(shortcuts()).toEqual([]);
+    textarea.parentElement?.remove();
+  });
+
+  it("keeps the tab open when a consumer only calls preventDefault", () => {
+    const textarea = mountTerminal((event) => event.preventDefault());
+
+    press(textarea, { key: "w", ctrlKey: true });
+
+    expect(shortcuts()).toEqual([]);
+    textarea.parentElement?.remove();
+  });
+
+  it("still closes the tab exactly once per unconsumed Ctrl+W or Cmd+W", () => {
+    const textarea = mountTerminal();
+
+    press(textarea, { key: "w", ctrlKey: true });
+    expect(shortcuts()).toHaveLength(1);
+    expect(shortcuts()[0]).toMatchObject({ source: "dbx-plugin", type: "shortcut", shortcut: "closeTab" });
+
+    press(textarea, { key: "w", metaKey: true });
+    expect(shortcuts()).toHaveLength(2);
+    expect(shortcuts()[1]).toMatchObject({ shortcut: "closeTab" });
+    textarea.parentElement?.remove();
+  });
+
+  it("leaves Tab, IME composition, and excluded modifier combinations alone", () => {
+    const textarea = mountTerminal();
+
+    press(textarea, { key: "Tab", ctrlKey: true });
+    press(textarea, { key: "w", ctrlKey: true, shiftKey: true });
+    press(textarea, { key: "w", ctrlKey: true, altKey: true });
+    press(textarea, { key: "w", ctrlKey: true }, { isComposing: true });
+    press(textarea, { key: "w" });
+
+    expect(shortcuts()).toEqual([]);
+    textarea.parentElement?.remove();
   });
 });

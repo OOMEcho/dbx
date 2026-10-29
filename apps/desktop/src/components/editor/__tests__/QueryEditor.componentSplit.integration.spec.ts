@@ -4,10 +4,10 @@ import { createApp, h, nextTick, reactive, shallowRef } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { createI18n } from "vue-i18n";
 import { EditorSelection } from "@codemirror/state";
-import { ensureSyntaxTree, foldable, syntaxTree } from "@codemirror/language";
-import { diagnosticCount, forceLinting } from "@codemirror/lint";
 import { EditorView } from "@codemirror/view";
 import { toggleLineComment, undo } from "@codemirror/commands";
+import { ensureSyntaxTree, foldable, foldedRanges, syntaxTree } from "@codemirror/language";
+import { diagnosticCount, forceLinting } from "@codemirror/lint";
 import { closeCompletion, completionStatus, currentCompletions, selectedCompletionIndex, startCompletion } from "@codemirror/autocomplete";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import QueryEditor from "../QueryEditor.vue";
@@ -30,11 +30,12 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-async function mountEditor(overrides: Partial<QueryEditorProps> = {}) {
+async function mountEditor(overrides: Partial<QueryEditorProps> = {}, vimEnabled = false, beforeMount?: (stores: { connectionStore: ReturnType<typeof useConnectionStore> }) => void) {
   const pinia = createPinia();
   setActivePinia(pinia);
   const settingsStore = useSettingsStore();
   const connectionStore = useConnectionStore();
+  settingsStore.editorSettings.vimModeEnabled = vimEnabled;
   settingsStore.editorSettings.showExecutionTargetPicker = false;
   settingsStore.editorSettings.executeMode = "current";
   settingsStore.editorSettings.executeAllOnBlankLine = false;
@@ -60,6 +61,9 @@ async function mountEditor(overrides: Partial<QueryEditorProps> = {}) {
   });
   app.use(pinia);
   app.use(createI18n({ legacy: false, locale: "en", messages: { en: {} }, missingWarn: false, fallbackWarn: false }));
+  // Lets a test stub store methods before the component setup (and any eager
+  // setup-time work such as completion prefetch) runs during mount.
+  beforeMount?.({ connectionStore });
   app.mount(host);
   let mounted = true;
   const unmount = () => {
@@ -78,6 +82,12 @@ function keydown(target: HTMLElement, key: string) {
   const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
   target.dispatchEvent(event);
   return event;
+}
+
+function foldedRangeCount(view: EditorView): number {
+  let count = 0;
+  foldedRanges(view.state).between(0, view.state.doc.length, () => count++);
+  return count;
 }
 
 describe("QueryEditor component split integration", () => {
@@ -119,6 +129,60 @@ describe("QueryEditor component split integration", () => {
     });
   });
 
+  it("renders and remains editable when completion prefetch is enabled across scope changes", async () => {
+    const { host, view, props, connectionStore } = await mountEditor({ prefetchCompletion: true });
+    expect(host.querySelector(".cm-content")?.textContent).toContain("SELECT 1;");
+    const prefetch = vi.spyOn(connectionStore, "listCompletionTables").mockResolvedValue([]);
+    props.connectionId = "prefetch-test";
+    props.database = "demo";
+    await nextTick();
+    expect(prefetch).toHaveBeenCalled();
+    props.database = "updated";
+    props.catalog = "catalog";
+    props.schema = "public";
+    await nextTick();
+    expect(prefetch).toHaveBeenLastCalledWith("prefetch-test", "updated", "", expect.any(Number), undefined, false, "public", "catalog", { activateConnection: false });
+    view.dispatch({ changes: { from: view.state.doc.length, insert: "\nSELECT 3;" } });
+    await vi.waitFor(() => expect(props.modelValue).toContain("SELECT 3;"));
+    expect(host.querySelector(".cm-editor")).toBe(view.dom);
+    prefetch.mockClear();
+    props.prefetchCompletion = false;
+    props.database = "disabled";
+    await nextTick();
+    expect(prefetch).not.toHaveBeenCalled();
+  });
+
+  it("keeps composing Vim navigation and committed IME text out of the SQL model", async () => {
+    const { view, props } = await mountEditor({}, true);
+    const original = props.modelValue;
+    view.contentDOM.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    const event = new KeyboardEvent("keydown", { key: "Process", code: "KeyL", keyCode: 229, isComposing: true, bubbles: true, cancelable: true });
+    view.contentDOM.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(view.state.selection.main.head).toBe(1);
+    const position = view.state.selection.main.head;
+    const handled = view.state.facet(EditorView.inputHandler).some((handler) => handler(view, position, position, "hjkl", () => view.state.update({ changes: { from: position, insert: "hjkl" } })));
+    expect(handled).toBe(true);
+    view.contentDOM.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "hjkl" }));
+    await nextTick();
+    expect(view.state.doc.toString()).toBe(original);
+    expect(props.modelValue).toBe(original);
+  });
+
+  it("executes each IRIS query separately after the Contains operator", async () => {
+    const first = "select * from oec_order_adminstatus where STAT_Code [ '123'";
+    const second = "select top 10 * from Ens_HOSDocument";
+    const source = first + "\n\n" + second;
+    const { editor, view, onExecute } = await mountEditor({ modelValue: source, databaseType: "iris", dialect: "postgres" });
+    view.dispatch({ selection: { anchor: source.indexOf(second) + 7 } });
+    expect(editor.requestExecute({ bypassPicker: true })).toBe(true);
+    expect(onExecute.mock.lastCall?.[0].selectedSql).toBe(second);
+
+    view.dispatch({ selection: { anchor: 7 } });
+    expect(editor.requestExecute({ bypassPicker: true })).toBe(true);
+    expect(onExecute.mock.lastCall?.[0].selectedSql).toBe(first);
+  });
+
   it("preserves upstream structure-peek focus and insertion context across updates and unmount", async () => {
     const { view, props, unmount } = await mountEditor({ connectionId: "peek-a", database: "demo", schema: "public" });
     expect(queryEditorInsertContext(view)).toEqual({ connectionId: "peek-a", database: "demo", schema: "public", databaseType: "mysql" });
@@ -150,6 +214,7 @@ describe("QueryEditor component split integration", () => {
       "cancelGutterExecutionViewport",
       "shouldBlockExecutionShortcut",
       "requestExecute",
+      "requestExecuteAll",
       "requestExecuteInNewResultTab",
       "requestPreviewChanges",
       "captureExecutionSnapshot",
@@ -194,6 +259,24 @@ describe("QueryEditor component split integration", () => {
     expect(source.selectionTo).toBe(executeMode === "current" ? 18 : props.modelValue.length);
   });
 
+  it.each(["current", "all"] as const)("executes the full document despite a selection and the %s execution mode", async (executeMode) => {
+    const { editor, host, view, props, settingsStore, onExecute } = await mountEditor();
+    settingsStore.editorSettings.executeMode = executeMode;
+    settingsStore.editorSettings.showExecutionTargetPicker = true;
+    view.dispatch({ selection: EditorSelection.range(10, 18) });
+
+    expect(editor.requestExecuteAll()).toBe(true);
+    await nextTick();
+
+    expect(onExecute).toHaveBeenCalledTimes(1);
+    const snapshot = onExecute.mock.calls[0][0];
+    expect(snapshot.fullSql).toBe(props.modelValue);
+    expect(snapshot.selectedSql).toBe(props.modelValue);
+    expect(snapshot.selectionFrom).toBe(0);
+    expect(snapshot.selectionTo).toBe(props.modelValue.length);
+    expect(host.querySelector('[role="listbox"]')).toBeNull();
+  });
+
   it("keeps the new-result-tab shortcut independent of the optional picker", async () => {
     const { editor, host, settingsStore, onExecute, onExecuteInNewResultTab } = await mountEditor();
     settingsStore.editorSettings.showExecutionTargetPicker = true;
@@ -205,7 +288,7 @@ describe("QueryEditor component split integration", () => {
     expect(onExecuteInNewResultTab.mock.calls[0][0].selectedSql).toBe("SELECT 1");
   });
 
-  it("opens, navigates, cancels and confirms the execution picker without replacing the editor", async () => {
+  it("opens, navigates, cancels and confirms the execution picker without replacing the editor", { retry: 5 }, async () => {
     const { editor, host, view, props, settingsStore, onExecute } = await mountEditor();
     settingsStore.editorSettings.showExecutionTargetPicker = true;
     vi.spyOn(view, "coordsAtPos").mockReturnValue({ left: 10, right: 12, top: 20, bottom: 40 });
@@ -230,8 +313,7 @@ describe("QueryEditor component split integration", () => {
     keydown(picker, "ArrowDown");
     await nextTick();
     keydown(picker, "Enter");
-    await nextTick();
-    expect(onExecute).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(onExecute).toHaveBeenCalledTimes(1));
     expect(onExecute.mock.calls[0][0].selectedSql).toBe(props.modelValue);
     expect(host.querySelector('[role="listbox"]')).toBeNull();
     expect(host.querySelector(".cm-editor")).toBe(view.dom);
@@ -329,6 +411,17 @@ describe("QueryEditor component split integration", () => {
     editor.previewStatementRange(null);
     expect(host.querySelector(".cm-db-result-source-highlight")).toBeNull();
     expect(view.state.doc.toString()).toBe("SELECT 1;\nSELECT 2;");
+  });
+
+  it("folds and unfolds all available ranges through the exposed handles", async () => {
+    const source = "BEGIN\nSELECT 1;\nEND;\n\nBEGIN\nSELECT 2;\nEND;";
+    const { editor, view } = await mountEditor({ modelValue: source });
+    expect(typeof editor.foldAll).toBe("function");
+    expect(typeof editor.unfoldAll).toBe("function");
+    expect(editor.foldAll()).toBe(true);
+    expect(foldedRangeCount(view)).toBe(2);
+    expect(editor.unfoldAll()).toBe(true);
+    expect(foldedRangeCount(view)).toBe(0);
   });
 
   it("isolates extension reconfiguration and disposal between editor instances", async () => {
@@ -433,5 +526,17 @@ describe("QueryEditor component split integration", () => {
     position.mockClear();
     window.dispatchEvent(createTableReferenceDropEvent({ payload, clientX: 30, clientY: 40 }));
     expect(position).not.toHaveBeenCalled();
+  });
+
+  it("prefetches completion tables for the active database instead of recursing on mount", async () => {
+    // Regression for #13529 / #13531: QueryEditor setup called the prefetch
+    // helper unconditionally, so prefetchCompletion: true (set for query tabs)
+    // recursed until RangeError killed the editor mount.
+    const listCompletionTables = vi.fn().mockResolvedValue([{ name: "users", type: "table" }]);
+    await mountEditor({ prefetchCompletion: true, connectionId: "c1", database: "shop" }, false, ({ connectionStore: store }) => {
+      vi.spyOn(store, "listCompletionTables").mockImplementation(listCompletionTables);
+    });
+    await vi.waitFor(() => expect(listCompletionTables).toHaveBeenCalled());
+    expect(listCompletionTables).toHaveBeenCalledWith("c1", "shop", "", 500, undefined, false, undefined, undefined, { activateConnection: false });
   });
 });

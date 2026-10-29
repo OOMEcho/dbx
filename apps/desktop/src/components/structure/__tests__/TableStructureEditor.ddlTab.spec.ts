@@ -1,4 +1,4 @@
-// @vitest-environment happy-dom
+﻿// @vitest-environment happy-dom
 
 import { createApp, nextTick, type App } from "vue";
 import { EditorView } from "@codemirror/view";
@@ -41,7 +41,7 @@ const mocks = vi.hoisted(() => ({
   toast: vi.fn(),
 }));
 
-vi.mock("vue-i18n", () => ({ useI18n: () => ({ t: (key: string) => key }) }));
+vi.mock("vue-i18n", async (original) => ({ ...(await original<typeof import("vue-i18n")>()), useI18n: () => ({ t: (key: string) => key }) }));
 
 vi.mock("@lucide/vue", async () => {
   const { defineComponent, h } = await import("vue");
@@ -263,6 +263,8 @@ vi.mock("@/components/editor/EditorSearchPanel.vue", async () => {
 vi.mock("@/stores/connectionStore", () => ({
   useConnectionStore: () => ({
     ensureConnected: mocks.ensureConnected,
+    connectionStateRevision: () => 0,
+    isCurrentConnectionStateRevision: () => true,
     getConfig: (connectionId: string) => (connectionId === mocks.connection.id ? mocks.connection : undefined),
   }),
 }));
@@ -392,7 +394,7 @@ beforeEach(() => {
   mocks.executeQuery.mockResolvedValue({ columns: [], rows: [] });
   mocks.executeBatch.mockResolvedValue({ rowsAffected: 0 });
   mocks.listDataTypes.mockResolvedValue([]);
-  mocks.getTablePartitionStatus.mockResolvedValue({ isPartitionedParent: false, isPartition: false });
+  mocks.getTablePartitionStatus.mockResolvedValue({ isPartitionedParent: false, isPartition: false, isForeign: false });
   mocks.getTableOwner.mockResolvedValue("");
   mocks.buildTableOwnerChangeSql.mockResolvedValue({ statements: [], warnings: [] });
   mocks.buildTableStructureChangeSql.mockResolvedValue({ statements: [], warnings: [] });
@@ -417,6 +419,19 @@ afterEach(() => {
 });
 
 describe("TableStructureEditor DDL tab", () => {
+  it("loads CREATE OR REPLACE VIEW ddl when editing a view", async () => {
+    const viewDdl = "CREATE OR REPLACE VIEW `active_users` AS\nSELECT id FROM users;";
+    mocks.loadObjectDdl.mockResolvedValue({ ddl: viewDdl, cacheStatus: "remote" });
+
+    const root = await mountStructureEditor({ database: "app", schema: "app", tableName: "active_users", tableType: "view" });
+    await clickTab(root, "ddl");
+    await vi.waitFor(() => expect(ddlEditorText(root)).toContain("CREATE OR REPLACE VIEW"), { timeout: 3000 });
+
+    expect(ddlEditorText(root)).toContain("`active_users`");
+    expect(ddlEditorText(root)).not.toContain("CREATE TABLE");
+    expect(mocks.loadObjectDdl).toHaveBeenCalledWith(expect.objectContaining({ tableName: "active_users", objectType: "VIEW" }), expect.anything());
+  });
+
   it("keeps the DDL rendered when the tab is left and revisited", async () => {
     // Regression for #7818/#7778: the second visit re-mounts the pane one tick
     // after the tab activates, and nothing re-fetches (the DDL is already

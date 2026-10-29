@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { mysqlDataCharsetEnabled } from "@/lib/connection/mysqlDataCharset";
 // PR-A4/P2 global bottom panel dock (HOST_PLUGIN_UI_SPEC §8.3) — a generic host container:
 // it only provides the panel frame (tab strip, drag-resize height, collapse/maximize/hide) and hosts any plugin's
 // panel webviews, with zero plugin business inside; multi-terminal/shell selection/connection switching all live in the plugin
@@ -274,7 +275,7 @@ function onPlusAction(value: string) {
           host: connection.host,
           port: connection.port,
           username: connection.username,
-          readOnly: connection.read_only === true,
+          readOnly: mysqlDataCharsetEnabled(connection) || connection.read_only === true,
         },
       },
     });
@@ -297,11 +298,26 @@ function rerunActiveCommand() {
 
 // A dock-hosted webview asking for another panel via the bridge openWorkbench: the host rebuilds the authoritative
 // context (dropping plugin-supplied reserved fields) and adds one generic panel entry.
-function onPanelOpenWorkbench(entry: (typeof entries.value)[number], _contributionId: string, childContext?: Record<string, unknown>) {
+// `options.target === "tab"` (bridge extension) routes to the main-workbench tab
+// path instead — same reuse/session-numbering semantics as tab-surface callers
+// (queryStore.openPluginWorkbench). Without the option the dock-entry behavior
+// is unchanged, so older plugins keep working.
+function onPanelOpenWorkbench(entry: (typeof entries.value)[number], _contributionId: string, childContext?: Record<string, unknown>, options?: { forceNew?: boolean; target?: "tab" }) {
   const payload = childContext && typeof childContext === "object" && !Array.isArray(childContext) ? { ...childContext } : {};
   delete payload.workbenchId;
   delete payload.restored;
   delete payload.surface;
+  if (options?.target === "tab") {
+    // Title derivation mirrors the tab-surface caller (PluginWorkbenchTab
+    // openWorkbench): per-connection sessions are titled after the connection
+    // display name, falling back to the localized workbench label and the
+    // dock entry's title — never the raw contribution id.
+    const contextConnectionId = typeof payload.connectionId === "string" ? payload.connectionId : "";
+    const connectionName = contextConnectionId ? connectionStore.getConfig(contextConnectionId)?.name : undefined;
+    const label = createFrontendPluginRegistry(plugins.value, locale.value).findWorkbench(entry.pluginId, entry.workbenchContributionId)?.contribution.label;
+    queryStore.openPluginWorkbench(entry.pluginId, entry.workbenchContributionId, { title: connectionName || label || entry.title, context: payload, forceNew: options.forceNew === true });
+    return;
+  }
   const id = addPluginDockEntry({
     pluginId: entry.pluginId,
     workbenchContributionId: entry.workbenchContributionId,
@@ -313,6 +329,15 @@ function onPanelOpenWorkbench(entry: (typeof entries.value)[number], _contributi
     commandContext: payload,
   });
   activatePluginDockEntry(id);
+}
+
+function onSetEntryTitle(entry: PluginDockEntry, title: string | null) {
+  if (title && title.trim()) {
+    renamePluginDockEntry(entry.id, title.trim());
+  } else {
+    const contribution = workbenchContributionFor(entry);
+    renamePluginDockEntry(entry.id, contribution?.label || entry.workbenchContributionId);
+  }
 }
 
 // §8.3/§7.4 two-phase close: removing an entry first asks its panel webview to
@@ -615,16 +640,19 @@ onScopeDispose(() => window.removeEventListener("blur", onPlusMenuWindowBlur));
         <X class="h-3.5 w-3.5" />
       </Button>
     </div>
-    <div class="min-h-0 flex-1 overflow-hidden">
-      <div v-for="entry in entries" v-show="entry.id === activeEntryId && !collapsed" :key="entry.id" class="h-full w-full">
+    <div class="relative min-h-0 flex-1 overflow-hidden">
+      <div v-for="entry in entries" :key="entry.id" class="size-full min-h-0" :class="entry.id === activeEntryId && !collapsed ? 'relative flex size-full' : 'pointer-events-none absolute inset-0 -z-10 invisible'">
         <PluginWorkbenchHost
           v-if="workbenchContributionFor(entry)"
           :ref="setWorkbenchHostRef(entry.id)"
+          :active="entry.id === activeEntryId && !collapsed"
           :plugin="definitionFor(entry.pluginId)!"
           :contribution="workbenchContributionFor(entry)!"
           :context="entry.context"
+          :set-title="(title) => onSetEntryTitle(entry, title)"
+          :get-title="() => entry.title"
           @close-tab="closeEntry(entry.id)"
-          @open-workbench="(_pluginId, contributionId, context) => onPanelOpenWorkbench(entry, contributionId, context)"
+          @open-workbench="(_pluginId, contributionId, context, options) => onPanelOpenWorkbench(entry, contributionId, context, options)"
         />
       </div>
     </div>

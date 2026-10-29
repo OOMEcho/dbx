@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTransferObjectSelections, countTransferObjects, matchBulkObjectNames, parseBulkObjectNames } from "../transferSelections";
+import { buildTransferObjectSelectionField, buildTransferObjectSelections, countTransferObjects, matchBulkObjectNames, parseBulkObjectNames } from "../transferSelections";
 
 function setOf(names: string[]): Set<string> {
   return new Set(names);
@@ -24,6 +24,19 @@ describe("countTransferObjects", () => {
 });
 
 describe("buildTransferObjectSelections", () => {
+  it("retains separate same-name package selections and omits them only from a data-only request", () => {
+    const selected = { TABLE: setOf(["orders"]), PACKAGE: setOf(["Pkg.With.Dot😀"]), PACKAGE_BODY: setOf(["Pkg.With.Dot😀"]) };
+    const fields = buildTransferObjectSelectionField(selected, []);
+    expect(fields.objects).toEqual([
+      { objectType: "PACKAGE", names: ["Pkg.With.Dot😀"] },
+      { objectType: "PACKAGE_BODY", names: ["Pkg.With.Dot😀"] },
+    ]);
+    expect(countTransferObjects({ tables: ["orders"], ...fields })).toBe(3);
+    expect(buildTransferObjectSelectionField(selected, ["PACKAGE", "PACKAGE_BODY"]).objects).toEqual([]);
+    expect(buildTransferObjectSelectionField(selected, []).objects).toEqual(fields.objects);
+    expect(buildTransferObjectSelectionField({ PACKAGE_BODY: selected.PACKAGE_BODY }, []).objects).toEqual([{ objectType: "PACKAGE_BODY", names: ["Pkg.With.Dot😀"] }]);
+  });
+
   it("serializes non-table selections in request order", () => {
     const result = buildTransferObjectSelections(
       {
@@ -42,6 +55,23 @@ describe("buildTransferObjectSelections", () => {
   it("drops TABLE selections (handled by the tables field)", () => {
     const result = buildTransferObjectSelections({ TABLE: setOf(["t1", "t2"]) }, []);
     expect(result).toEqual([]);
+  });
+
+  it("keeps an explicit empty objects field for a saved TABLE-only request", () => {
+    const request = {
+      tables: ["orders"],
+      ...buildTransferObjectSelectionField({ TABLE: setOf(["orders"]) }, []),
+    };
+    expect(Object.hasOwn(request, "objects")).toBe(true);
+    expect(request.objects).toEqual([]);
+  });
+
+  it("keeps only the non-table selection for a saved TABLE + VIEW request", () => {
+    const request = {
+      tables: ["orders"],
+      ...buildTransferObjectSelectionField({ TABLE: setOf(["orders"]), VIEW: setOf(["v_orders"]) }, []),
+    };
+    expect(request.objects).toEqual([{ objectType: "VIEW", names: ["v_orders"] }]);
   });
 
   it("filters disabled object types even when stale selections remain", () => {

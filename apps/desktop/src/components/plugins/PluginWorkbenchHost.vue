@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { mysqlDataCharsetEnabled } from "@/lib/connection/mysqlDataCharset";
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { AlertTriangle, Loader2 } from "@lucide/vue";
 import * as api from "@/lib/backend/api";
@@ -18,7 +19,10 @@ import {
   type PluginWorkbenchContext,
   type PluginAiRecommendationHostUpdate,
 } from "@/lib/plugins/pluginHostBridge";
-import { getCachedPluginUiHtml, getOrLoadPluginUiHtml } from "@/lib/plugins/pluginUiHtmlCache";
+import { getCachedPluginUiHtml, getOrLoadPluginUiHtml, pluginUiAssetBaseUrl } from "@/lib/plugins/pluginUiHtmlCache";
+import { isPluginGraphicsEngineEnabled } from "@/lib/plugins/pluginGraphicsEngine";
+import { beginFloatingWindowDrag, closeFloatingWindows, endFloatingWindowDrag, openFloatingWindow, setFloatingWindowSize } from "@/lib/plugins/pluginFloatingWindow";
+import { isFloatingPluginWindow } from "@/lib/app/windowContext";
 import { buildPluginEditorAppearance } from "@/lib/plugins/pluginAppearance";
 import { createFrontendPluginRegistry } from "@/lib/plugins/frontendPlugin";
 import { executePluginCommand } from "@/lib/plugins/pluginCommandRegistry";
@@ -28,7 +32,7 @@ import { useI18n } from "vue-i18n";
 import { useTheme } from "@/composables/useTheme";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { createPluginAiCompletion } from "@/lib/plugins/pluginAiCompletion";
+import { createPluginAiCompletion, type PluginAiConfirmDecision, type PluginAiPromptPreview } from "@/lib/plugins/pluginAiCompletion";
 import { useQueryStore } from "@/stores/queryStore";
 import { OPEN_PLUGIN_AI_CONVERSATION } from "@/lib/ai/aiPluginConversation";
 
@@ -37,8 +41,11 @@ const props = withDefaults(
     plugin: InstalledPlugin;
     contribution: PluginUiContribution;
     context?: PluginWorkbenchContext;
+    active?: boolean;
+    setTitle?: (title: string | null) => Promise<void> | void;
+    getTitle?: () => Promise<string> | string;
   }>(),
-  { context: () => ({}) },
+  { context: () => ({}), active: true },
 );
 
 const emit = defineEmits<{
@@ -54,16 +61,90 @@ const { t, locale: appLocale } = useI18n();
 const { isDark, themeRevision } = useTheme();
 const settingsStore = useSettingsStore();
 const openAiConversation = inject(OPEN_PLUGIN_AI_CONVERSATION, undefined);
+// Per-plugin grant for `script-src 'unsafe-eval'`; flipping it rebuilds the
+// sandbox document (and must not reuse a doc cached under the other setting).
+const graphicsEngineEnabled = computed(() => isPluginGraphicsEngineEnabled(settingsStore.editorSettings.pluginGraphicsEngineIds, props.plugin.manifest.id));
+
+// --- Plugin AI generation consent (E2) --------------------------------------
+// Every host.ai.generateText send is consented through this in-app dialog: it
+// names the destination model, previews the outgoing text (first line, byte
+// size, workbench context) and offers a workbench-session "don't ask again"
+// memory. The memory itself lives inside the aiCompletion instance (in-memory
+// only, never persisted) — the checkbox here just reports the user's choice.
+interface PluginAiConfirmDialogState {
+  title: string;
+  message: string;
+  preview: PluginAiPromptPreview;
+  previewHeading: string;
+  sizeLabel: string;
+  contextLabel: string;
+  rememberLabel: string;
+  continueLabel: string;
+  cancelLabel: string;
+}
+const aiConfirmDialog = ref<PluginAiConfirmDialogState | null>(null);
+const aiConfirmRemember = ref(false);
+let aiConfirmResolve: ((decision: PluginAiConfirmDecision) => void) | undefined;
+
+function formatPluginAiContextLabel(): string {
+  const zh = appLocale.value.startsWith("zh");
+  const parts: string[] = [];
+  const connectionId = typeof props.context?.connectionId === "string" ? props.context.connectionId : "";
+  if (connectionId) {
+    const connectionName = useConnectionStore().getConfig(connectionId)?.name || connectionId;
+    parts.push(`${zh ? "连接" : "Connection"}: ${connectionName}`);
+  }
+  for (const key of ["database", "schema"] as const) {
+    const value = props.context?.[key];
+    if (typeof value === "string" && value.trim()) parts.push(`${zh ? (key === "database" ? "数据库" : "模式") : key === "database" ? "Database" : "Schema"}: ${value.trim()}`);
+  }
+  return parts.join(" · ");
+}
+
+function resolveAiGenerationConfirm(allowed: boolean): void {
+  const resolve = aiConfirmResolve;
+  aiConfirmResolve = undefined;
+  const remember = aiConfirmRemember.value;
+  aiConfirmDialog.value = null;
+  aiConfirmRemember.value = false;
+  // A denial is never remembered: the plugin may legitimately retry, and the
+  // memory option only takes effect together with an explicit allow.
+  resolve?.(allowed ? { allowed: true, remember } : false);
+}
+
 const aiCompletion = createPluginAiCompletion({
   load: () => import("@/lib/backend/tauri").then((api) => api.loadAiConfigs()),
   discover: (config) => import("@/lib/backend/tauri").then((api) => api.aiListModels(config)),
   complete: (request) => import("@/lib/backend/tauri").then((api) => api.aiComplete(request)),
-  confirm: async (pluginName, model) => {
-    const { ask } = await import("@tauri-apps/plugin-dialog");
+  // E1: ride the desktop streaming pipeline (ai_stream + per-session cancel
+  // registry). Only wired here, so the bridge advertises aiCompletionStream
+  // on desktop hosts and leaves it off elsewhere.
+  stream: async (sessionId, request, onChunk) => {
+    const { aiStream } = await tauriFileApi();
+    await aiStream(sessionId, request, onChunk);
+  },
+  cancel: async (sessionId) => {
+    const { aiCancelStream } = await tauriFileApi();
+    return await aiCancelStream(sessionId);
+  },
+  confirm: async (pluginName, model, preview) => {
     const zh = appLocale.value.startsWith("zh");
-    return ask(zh ? `插件「${pluginName}」将把准备的文本发送给「${model.name} / ${model.model}」，并读取生成结果。是否继续？` : `Plugin "${pluginName}" will send its prepared text to "${model.name} / ${model.model}" and receive the generated result. Continue?`, {
-      title: zh ? "插件 AI 生成" : "Plugin AI generation",
-      kind: "info",
+    const message = zh ? `插件「${pluginName}」将把准备的文本发送给「${model.name} / ${model.model}」，并读取生成结果。` : `Plugin "${pluginName}" will send its prepared text to "${model.name} / ${model.model}" and receive the generated result.`;
+    const contextLabel = formatPluginAiContextLabel();
+    return await new Promise<PluginAiConfirmDecision>((resolve) => {
+      aiConfirmResolve = resolve;
+      aiConfirmRemember.value = false;
+      aiConfirmDialog.value = {
+        title: zh ? "插件 AI 生成" : "Plugin AI generation",
+        message,
+        preview,
+        previewHeading: zh ? "将发送的内容（首行）" : "Content to send (first line)",
+        sizeLabel: zh ? `全文 ${preview.bytes} 字节` : `${preview.bytes} bytes total`,
+        contextLabel: contextLabel ? `${zh ? "上下文" : "Context"}: ${contextLabel}` : "",
+        rememberLabel: zh ? "本工作台内不再询问" : "Don't ask again in this workbench",
+        continueLabel: zh ? "继续" : "Continue",
+        cancelLabel: zh ? "取消" : "Cancel",
+      };
     });
   },
 });
@@ -93,12 +174,16 @@ let bootCacheHit = false;
 // read with "unknown plugin file handle". Every path is consented to on the
 // Rust side — dialogs open there (plugin_file_pick_files / plugin_file_save_as)
 // and drops are registered by the native drag-drop pipeline before
-// plugin_file_open accepts them — never a plugin-supplied string.
+// plugin_file_open_dropped accepts them — never a plugin-supplied string.
 
 let webFileSequence = 0;
 const webPickedFiles = new Map<string, File>();
 const webSaveBuffers = new Map<string, { name: string; contentType: string; chunks: Map<number, Uint8Array> }>();
-const openTauriHandles = new Set<string>();
+// raw handle id -> the plugin id that opened it, recorded at open time.
+// Teardown closes precisely these handles: an owner-wide sweep would also
+// kill the SAME plugin's handles held by a sibling workbench instance, so it
+// is reserved for Rust-side lifecycle (stop/uninstall) only.
+const openTauriHandles = new Map<string, string>();
 const tauriHandlePrefix = "t";
 const webHandlePrefix = "w";
 
@@ -124,15 +209,21 @@ async function tauriFileApi() {
 }
 
 // OS drops are the one flow where the renderer still names a path: the native
-// drag-drop pipeline registered the dropped files for THIS webview, and
-// plugin_file_open accepts exactly those (one open per dropped file).
-async function openTauriPluginFile(pluginId: string, path: string, write: boolean): Promise<PluginFileHandleMeta> {
-  const { openPluginLocalFile } = await tauriFileApi();
-  const handle = await openPluginLocalFile(pluginId, path, write);
-  // Track read AND write handles: unmount must reclaim both (leaked fds also
-  // burn the shared 64-handle registry quota).
-  openTauriHandles.add(handle.handleId);
-  return { handleId: `${tauriHandlePrefix}${handle.handleId}`, name: handle.name, size: handle.size, contentType: handle.contentType };
+// drag-drop pipeline registered the dropped paths for THIS webview, and
+// plugin_file_open_dropped accepts exactly those (one open attempt per dropped
+// path). A dropped folder comes back expanded to its contained files on the
+// Rust side, with `truncated` flagging any cap cutoff and a `dropId` grouping
+// the entries of this one drop.
+async function openDroppedPluginFiles(pluginId: string, paths: string[]): Promise<{ dropId: string; truncated: boolean; files: PluginFileHandleMeta[] }> {
+  const { openDroppedPluginLocalFiles } = await tauriFileApi();
+  const result = await openDroppedPluginLocalFiles(pluginId, paths);
+  const files = result.files.map((handle) => {
+    openTauriHandles.set(handle.handleId, pluginId);
+    const meta: PluginFileHandleMeta = { handleId: `${tauriHandlePrefix}${handle.handleId}`, name: handle.name, size: handle.size, contentType: handle.contentType };
+    if (handle.relativePath) meta.relativePath = handle.relativePath;
+    return meta;
+  });
+  return { dropId: result.dropId, truncated: result.truncated, files };
 }
 
 async function pickPluginFiles(pluginId: string, options: PluginPickFilesOptions): Promise<PluginFileHandleMeta[]> {
@@ -144,7 +235,7 @@ async function pickPluginFiles(pluginId: string, options: PluginPickFilesOptions
     for (const handle of await pickPluginLocalFiles(pluginId, options.multiple === true)) {
       // Track read AND write handles: unmount must reclaim both (leaked fds
       // also burn the shared 64-handle registry quota).
-      openTauriHandles.add(handle.handleId);
+      openTauriHandles.set(handle.handleId, pluginId);
       files.push({ handleId: `${tauriHandlePrefix}${handle.handleId}`, name: handle.name, size: handle.size, contentType: handle.contentType });
     }
     return files;
@@ -233,7 +324,7 @@ async function beginPluginFileSave(pluginId: string, request: { name?: string; c
     const { savePluginLocalFileAs } = await tauriFileApi();
     const handle = await savePluginLocalFileAs(pluginId, request.name || "download.bin");
     if (!handle) return null;
-    openTauriHandles.add(handle.handleId);
+    openTauriHandles.set(handle.handleId, pluginId);
     return { handleId: `${tauriHandlePrefix}${handle.handleId}`, chunkBytes: PLUGIN_SAVE_CHUNK_BYTES };
   }
   const handleId = `${webHandlePrefix}${++webFileSequence}`;
@@ -257,8 +348,11 @@ async function finishPluginFileSave(pluginId: string, handleId: string): Promise
   const parsed = parseHandleId(handleId);
   if (parsed.source === "tauri") {
     const { closePluginLocalFile } = await tauriFileApi();
-    openTauriHandles.delete(parsed.rawId);
     await closePluginLocalFile(pluginId, parsed.rawId);
+    // Drop local tracking only after the close succeeded: a failed flush
+    // leaves the Rust entry alive, and the map is what unmount cleanup uses
+    // to retry it.
+    openTauriHandles.delete(parsed.rawId);
     return;
   }
   const buffer = webSaveBuffers.get(handleId);
@@ -284,8 +378,8 @@ async function closePluginFileHandleById(pluginId: string, handleId: string): Pr
   const parsed = parseHandleId(handleId);
   if (parsed.source === "tauri") {
     const { closePluginLocalFile } = await tauriFileApi();
-    openTauriHandles.delete(parsed.rawId);
     await closePluginLocalFile(pluginId, parsed.rawId);
+    openTauriHandles.delete(parsed.rawId);
     return;
   }
   webPickedFiles.delete(handleId);
@@ -293,9 +387,11 @@ async function closePluginFileHandleById(pluginId: string, handleId: string): Pr
 }
 
 function disposeLocalFileHandles(): void {
-  for (const handleId of openTauriHandles)
-    tauriFileApi()
-      .then(({ closePluginLocalFile }) => closePluginLocalFile(props.plugin.manifest.id, handleId))
+  // Close exactly the handles THIS instance opened, with the plugin id that
+  // opened them — a sibling workbench of the same plugin keeps its own.
+  for (const [handleId, pluginId] of openTauriHandles)
+    void tauriFileApi()
+      .then(({ closePluginLocalFile }) => closePluginLocalFile(pluginId, handleId))
       .catch(() => undefined);
   openTauriHandles.clear();
   webPickedFiles.clear();
@@ -318,10 +414,12 @@ interface TauriFileDropPayload {
 }
 
 let dropDragActive = false;
+let lastDragPoint: { x: number; y: number } | null = null;
 
-function forwardDragState(active: boolean): void {
+function forwardDragState(active: boolean, position?: { x: number; y: number }): void {
   dropDragActive = active;
-  bridge?.forwardDragState(active);
+  lastDragPoint = active && position ? { x: position.x, y: position.y } : null;
+  bridge?.forwardDragState(active, position);
 }
 
 function onHostFileDrop(event: Event): void {
@@ -338,34 +436,85 @@ function onHostFileDrop(event: Event): void {
   }
   // Overlay titlebar: the webview starts at the window origin, so physical
   // window coordinates divide straight into CSS pixels via devicePixelRatio.
-  const scale = window.devicePixelRatio || 1;
-  if (document.elementFromPoint(position.x / scale, position.y / scale) !== frame) {
+  // A non-finite ratio (e.g. a NaN reading) must behave like 1 so a bad
+  // reading cannot turn every forwarded coordinate into NaN.
+  const dpr = window.devicePixelRatio;
+  const scale = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+  const cssX = position.x / scale;
+  const cssY = position.y / scale;
+  if (document.elementFromPoint(cssX, cssY) !== frame) {
     if (dropDragActive) forwardDragState(false);
     return;
   }
   // Claim the drop so the host fallback (open as SQL/database) does not run.
   event.preventDefault();
+  const rect = frame.getBoundingClientRect();
+  const point = {
+    x: cssX - rect.left,
+    y: cssY - rect.top,
+  };
   if (payload.type !== "drop") {
-    if (!dropDragActive) forwardDragState(true);
+    if (dropDragActive && lastDragPoint && Math.abs(lastDragPoint.x - point.x) < 1 && Math.abs(lastDragPoint.y - point.y) < 1) {
+      return;
+    }
+    forwardDragState(true, point);
     return;
   }
-  forwardDragState(false);
   const paths = (payload.paths || []).filter((path) => typeof path === "string" && path);
-  if (!paths.length || !bridge) return;
+  if (!paths.length || !bridge) {
+    forwardDragState(false);
+    return;
+  }
+  // Pin the owner and generation before the await: the expansion runs on a
+  // Rust blocking thread and can land after a teardown or identity rebuild.
+  const pluginId = props.plugin.manifest.id;
+  const generation = loadGeneration;
   void (async () => {
-    const files: PluginFileHandleMeta[] = [];
-    for (const path of paths) {
-      try {
-        files.push(await openTauriPluginFile(props.plugin.manifest.id, path, false));
-      } catch (error) {
-        console.error("[DBX][plugin-workbench:drop]", error);
+    try {
+      // A granted folder comes back expanded to its files; a path the drop
+      // pipeline never granted (or that vanished) is skipped on the Rust side,
+      // so an empty result surfaces here instead of silently handing the
+      // plugin nothing while the drop looked successful.
+      const { dropId, truncated, files } = await openDroppedPluginFiles(pluginId, paths);
+      if (disposed || generation !== loadGeneration) {
+        // The teardown already ran while the expansion was in flight: retire
+        // exactly these late arrivals — a closeAll here would also kill the
+        // same plugin's handles in a freshly rebuilt workbench.
+        const rawIds = files.map((file) => file.handleId.replace(new RegExp(`^${tauriHandlePrefix}`), ""));
+        void tauriFileApi().then(({ closePluginLocalFile }) => {
+          for (const rawId of rawIds) closePluginLocalFile(pluginId, rawId).catch(() => undefined);
+        });
+        return;
+      }
+      if (files.length) {
+        bridge?.forwardFileDrop(files, { dropId, truncated, position: point });
+      } else {
+        console.error("[DBX][plugin-workbench:drop] no dropped files could be opened", paths);
+      }
+    } catch (error) {
+      console.error("[DBX][plugin-workbench:drop]", error);
+    } finally {
+      if (!disposed && generation === loadGeneration) {
+        forwardDragState(false);
       }
     }
-    if (files.length) bridge?.forwardFileDrop(files);
   })();
 }
 
 const title = computed(() => `${props.plugin.manifest.name} · ${props.contribution.label}`);
+
+/**
+ * The §8.3 surface this host renders on. The tab surface keeps a minimum height
+ * (a workbench needs room to be usable); the dock and floating-window surfaces
+ * are sized by their own container, where a floor would make the frame taller
+ * than the visible area and swallow clicks near its bottom edge. The floating
+ * surface is transparent: the widget paints its own shape.
+ */
+const surface = computed(() => (typeof props.context?.surface === "string" ? props.context.surface : "tab"));
+const hostSurfaceClass = computed(() => (surface.value === "tab" ? "min-h-40 bg-background" : surface.value === "window" ? "min-h-0 bg-transparent" : "min-h-0 bg-background"));
+/** The loading overlays must not paint an opaque box inside a transparent floating window. */
+const overlayClass = computed(() => (surface.value === "window" ? "bg-transparent" : "bg-background"));
+const isFloatingSurface = isFloatingPluginWindow();
 
 /** Collect resolved DBX design tokens so the sandbox can theme itself with the same values. */
 function currentBridgeTheme(): PluginBridgeTheme {
@@ -403,27 +552,112 @@ function createBridge() {
       ...(isTauriRuntime() ? aiCompletion : {}),
       setAiRecommendations: (update) => emit("recommendations", update),
       openWorkbench: async (pluginId, contributionId, context, options) => emit("openWorkbench", pluginId, contributionId, context, options),
+      // Only expose the title APIs on surfaces that implement them (workbench
+      // tab and dock hosts pass the props); the bridge derives the
+      // `workbenchTitle` capability from their presence, so floating windows
+      // and sidebar hosts must not advertise a silent no-op.
+      ...(() => {
+        const setTitleProp = props.setTitle;
+        const getTitleProp = props.getTitle;
+        return {
+          ...(setTitleProp
+            ? {
+                setTitle: async (newTitle: string | null) => {
+                  await setTitleProp(newTitle);
+                },
+              }
+            : {}),
+          ...(getTitleProp
+            ? {
+                getTitle: async () => await getTitleProp(),
+              }
+            : {}),
+        };
+      })(),
       // §4/§5 bridge command execution, scoped to this plugin's own manifest:
       // the single-plugin registry is equivalent here because findCommand /
       // findWorkbench / enablement never cross plugins. Panel commands dock,
       // tab commands open tabs, §4.1 reuse with `instance_key` placeholder
-      // scoping — identical to menu execution.
-      executeCommand: (pluginId, commandId, context) => executePluginCommand(createFrontendPluginRegistry([props.plugin], appLocale.value), useQueryStore(), pluginId, commandId, context),
+      // scoping — identical to menu execution. Not offered on the floating
+      // surface: every command action opens a shell surface (a dock entry or a
+      // workbench tab) that a floating widget window does not have, so it would
+      // resolve successfully and show nothing. There, plugins navigate with
+      // openWorkbench / floating.open, which the host routes to the main window.
+      ...(isFloatingSurface ? {} : { executeCommand: (pluginId: string, commandId: string, context?: Record<string, unknown>) => executePluginCommand(createFrontendPluginRegistry([props.plugin], appLocale.value), useQueryStore(), pluginId, commandId, context) }),
       openFilesystem: async (pluginId, providerId, context) => emit("openFilesystem", pluginId, providerId, context),
       reopenConnection: (pluginId, connectionId) => useConnectionStore().reopenPluginConnection(connectionId, pluginId),
       // PR-A4 generic extension point: a read-only, secret-free, plugin-scoped connection list (for in-panel connection switching).
-      listConnections: (ownerPluginId) => {
+      // Extended for #12603 with `host.connections:read` / options.all to return all connections.
+      listConnections: (ownerPluginId, options?: { all?: boolean }) => {
+        const connectionStore = useConnectionStore();
+        const queryStore = useQueryStore();
+        const connectedIds = connectionStore.connectedIds;
+        if (options?.all) {
+          return connectionStore.connections.map((connection) => {
+            const connected = connectedIds.has(connection.id);
+            return {
+              id: connection.id,
+              name: connection.name,
+              dbType: connection.db_type,
+              dialect: connection.db_type,
+              databaseType: connection.db_type,
+              connected,
+              isConnected: connected,
+              readOnly: mysqlDataCharsetEnabled(connection) || connection.read_only === true,
+              database: connection.database,
+              schema: connection.default_schema,
+              providerId: connection.plugin_connection_provider ?? "",
+              connectionType: connection.plugin_connection_type,
+              workbenchTitles: queryStore.pluginWorkbenchTitles(connection.id),
+            };
+          });
+        }
         const providerIds = new Set((props.plugin.manifest.contributions || []).filter((candidate) => candidate.type === "connection-provider").map((candidate) => candidate.id));
         if (ownerPluginId !== props.plugin.manifest.id) return [];
-        return useConnectionStore()
-          .connections.filter((connection) => providerIds.has(connection.plugin_connection_provider ?? ""))
-          .map((connection) => ({
+        return connectionStore.connections
+          .filter((connection) => providerIds.has(connection.plugin_connection_provider ?? ""))
+          .map((connection) => {
+            const connected = connectedIds.has(connection.id);
+            return {
+              id: connection.id,
+              name: connection.name,
+              dbType: connection.db_type,
+              dialect: connection.db_type,
+              databaseType: connection.db_type,
+              connected,
+              isConnected: connected,
+              providerId: connection.plugin_connection_provider ?? "",
+              connectionType: connection.plugin_connection_type,
+              readOnly: mysqlDataCharsetEnabled(connection) || connection.read_only === true,
+              database: connection.database,
+              schema: connection.default_schema,
+              // #193b — dock/tab titles bound to the connection (dock first), so plugins can label session rows after renamed terminals.
+              workbenchTitles: queryStore.pluginWorkbenchTitles(connection.id),
+            };
+          });
+      },
+      listAllConnections: () => {
+        const connectionStore = useConnectionStore();
+        const queryStore = useQueryStore();
+        const connectedIds = connectionStore.connectedIds;
+        return connectionStore.connections.map((connection) => {
+          const connected = connectedIds.has(connection.id);
+          return {
             id: connection.id,
             name: connection.name,
+            dbType: connection.db_type,
+            dialect: connection.db_type,
+            databaseType: connection.db_type,
+            connected,
+            isConnected: connected,
+            readOnly: mysqlDataCharsetEnabled(connection) || connection.read_only === true,
+            database: connection.database,
+            schema: connection.default_schema,
             providerId: connection.plugin_connection_provider ?? "",
             connectionType: connection.plugin_connection_type,
-            readOnly: connection.read_only === true,
-          }));
+            workbenchTitles: queryStore.pluginWorkbenchTitles(connection.id),
+          };
+        });
       },
       // Both plan calls carry the plugin's declared `host.plans:read` gate in the
       // bridge; the backend owns EXPLAIN generation, the timeout, and the plan cap.
@@ -439,6 +673,16 @@ function createBridge() {
         await api.setPluginDataGrant(pluginId, connectionId, true);
       },
       closeTab: () => emit("closeTab"),
+      // Floating widget windows (§8.3 surface "window"). Desktop-only: the web
+      // host omits them so capabilities.floating stays false and the plugin can
+      // fall back to an in-shell surface. Opening and closing work from any
+      // window; the geometry calls act on the window that hosts the caller and
+      // reject elsewhere, so a tab can never move a window it is not inside.
+      openFloatingWindow: isTauriRuntime() ? (request) => openFloatingWindow(request) : undefined,
+      closeFloatingWindows: isTauriRuntime() ? (labels) => closeFloatingWindows(labels) : undefined,
+      beginFloatingDrag: isTauriRuntime() ? () => beginFloatingWindowDrag() : undefined,
+      endFloatingDrag: isTauriRuntime() ? (snap) => endFloatingWindowDrag(snap) : undefined,
+      setFloatingSize: isTauriRuntime() ? (width, height) => setFloatingWindowSize(width, height) : undefined,
       saveFile: (_pluginId, request, data) => savePluginFile(request, data),
       downloadFile: isTauriRuntime() ? downloadPluginFile : undefined,
       cancelDownload: isTauriRuntime() ? cancelPluginDownload : undefined,
@@ -461,6 +705,9 @@ function createBridge() {
       writeFileChunk: (pluginId, handleId, offset, bytes) => writePluginFileChunkById(pluginId, handleId, offset, bytes),
       finishFileSave: (pluginId, handleId) => finishPluginFileSave(pluginId, handleId),
       closeFileHandle: (pluginId, handleId) => closePluginFileHandleById(pluginId, handleId),
+      // OS drops (with folder expansion) are a desktop-host capability; the
+      // bridge advertises it to plugins through capabilities.fileTransfer.
+      receiveOsDrops: isTauriRuntime(),
       storageGet: (pluginId, key) => getPluginStorage(pluginId, key),
       storageSet: (pluginId, key, value) => setPluginStorage(pluginId, key, value),
       storageDelete: (pluginId, key) => deletePluginStorage(pluginId, key),
@@ -535,20 +782,11 @@ async function savePluginFile(request: PluginSaveFileRequest, data: Uint8Array):
   return { path: fileName };
 }
 
-/**
- * Base URL prefix for lazy-loaded plugin UI assets. wry serves custom schemes
- * natively on WKWebView/webkit2gtk but maps them onto http(s) subdomains on
- * WebView2, so the host page's own protocol picks the form the webview will
- * actually request. The web host has no plugin asset protocol.
- */
-function pluginUiBaseUrl(pluginId: string, entryDirectory: string): string | undefined {
-  if (!isTauriRuntime()) return undefined;
-  const origin = location.protocol === "http:" || location.protocol === "https:" ? `${location.protocol}//dbx-plugin.localhost/${pluginId}/` : `dbx-plugin://localhost/${pluginId}/`;
-  return entryDirectory ? `${origin}${entryDirectory}/` : origin;
-}
-
 async function loadWorkbench() {
   const generation = ++loadGeneration;
+  // An identity rebuild swaps the plugin this component serves; retire the
+  // previous plugin's handles first or they would outlive their owner.
+  disposeLocalFileHandles();
   bridge?.dispose();
   bridge = undefined;
   loading.value = true;
@@ -574,12 +812,17 @@ async function loadWorkbench() {
     const { html, entryDirectory } = cachedHtml;
     // The final sandbox document is cached alongside the html: generating it
     // re-runs megabyte-scale string surgery on every boot.
-    if (!cachedHtml.sandboxDoc) {
-      cachedHtml.sandboxDoc = pluginSandboxDocument(html, props.plugin.manifest.permissions, currentBridgeTheme(), {
-        baseUrl: pluginUiBaseUrl(props.plugin.manifest.id, entryDirectory),
-      });
+    const allowUnsafeEval = graphicsEngineEnabled.value;
+    if (!cachedHtml.sandboxDoc || cachedHtml.sandboxDoc.allowUnsafeEval !== allowUnsafeEval) {
+      cachedHtml.sandboxDoc = {
+        allowUnsafeEval,
+        doc: pluginSandboxDocument(html, props.plugin.manifest.permissions, currentBridgeTheme(), {
+          baseUrl: pluginUiAssetBaseUrl(props.plugin.manifest.id, entryDirectory),
+          allowUnsafeEval,
+        }),
+      };
     }
-    source.value = cachedHtml.sandboxDoc;
+    source.value = cachedHtml.sandboxDoc.doc;
     await nextTick();
     if (disposed || generation !== loadGeneration) return;
     createBridge();
@@ -636,7 +879,7 @@ onMounted(async () => {
 // Identity changes require rebuilding the sandbox document; context and locale
 // changes are pushed through the bridge so plugin UI state survives them.
 watch(
-  () => [props.plugin.manifest.id, props.plugin.manifest.version, props.contribution.id] as const,
+  () => [props.plugin.manifest.id, props.plugin.manifest.version, props.contribution.id, graphicsEngineEnabled.value] as const,
   () => void loadWorkbench(),
 );
 watch(
@@ -657,6 +900,20 @@ watch(
   () => bridge?.updateTheme(currentBridgeTheme()),
 );
 
+function notifyLayout(): void {
+  bridge?.notifyLayout();
+}
+
+watch(
+  () => props.active,
+  async (active) => {
+    if (active) {
+      await nextTick();
+      notifyLayout();
+    }
+  },
+);
+
 /** §8.3/§7.4 two-phase close: parents await this before removing the entry so
  * the plugin can release its workbench scope (PTY sessions, subscriptions);
  * the bridge bounds the wait and resolves false on legacy/hung plugins. */
@@ -664,11 +921,16 @@ function requestClose(): Promise<boolean> {
   return bridge ? bridge.requestWorkbenchClose() : Promise.resolve(false);
 }
 
-defineExpose({ requestClose });
+defineExpose({ requestClose, notifyLayout });
 
 onBeforeUnmount(() => {
   disposed = true;
+  dropDragActive = false;
+  lastDragPoint = null;
   loadGeneration += 1;
+  // An unanswered consent dialog must not leave the plugin's generation
+  // request (and its busy lock) hanging on a dead workbench.
+  resolveAiGenerationConfirm(false);
   // Best-effort §8.3 close notice for teardown paths that never called
   // requestClose (tab closes, plugin reload): the message still goes out, but
   // delivery of the plugin's cleanup is not guaranteed once the iframe dies.
@@ -683,8 +945,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="relative flex size-full min-h-40 overflow-hidden bg-background">
-    <div v-if="loading" class="absolute inset-0 z-10 flex items-center justify-center bg-background text-sm text-muted-foreground">
+  <div class="relative flex size-full overflow-hidden" :class="hostSurfaceClass">
+    <div v-if="loading" class="absolute inset-0 z-10 flex items-center justify-center text-sm text-muted-foreground" :class="overlayClass">
       <Loader2 class="mr-2 size-4 animate-spin" />
       {{ t("pluginPlatform.loadingTitle", { title }) }}
     </div>
@@ -693,16 +955,43 @@ onBeforeUnmount(() => {
       <span>{{ error }}</span>
     </div>
     <template v-else>
-      <iframe ref="iframe" :title="title" :srcdoc="source" sandbox="allow-scripts" allow="clipboard-write" referrerpolicy="no-referrer" class="size-full border-0 bg-transparent" @load="onFrameLoad" />
+      <!-- `allow` delegates fullscreen into the sandboxed frame: without the
+           Permissions-Policy entry, requestFullscreen() rejects there no matter
+           which sandbox tokens are set (the legacy `allow-fullscreen` sandbox
+           flag was removed from the platform and logs an error when present). -->
+      <iframe ref="iframe" :title="title" :srcdoc="source" sandbox="allow-scripts" allow="clipboard-write; fullscreen" referrerpolicy="no-referrer" class="size-full border-0 bg-transparent" @load="onFrameLoad" />
       <!-- Cover until the frame has actually painted: the iframe stays mounted
            underneath so its load event can fire (v-else on the overlay would
            deadlock), it just isn't visible yet. Fully opaque so the covered
            phase is visually identical to the host background, and faded out
            instead of removed so the reveal is never a hard swap. -->
-      <div class="absolute inset-0 z-10 flex items-center justify-center bg-background text-sm text-muted-foreground transition-opacity duration-150 ease-out" :class="frameReady ? 'pointer-events-none opacity-0' : 'opacity-100'">
+      <div class="absolute inset-0 z-10 flex items-center justify-center text-sm text-muted-foreground transition-opacity duration-150 ease-out" :class="[overlayClass, frameReady ? 'pointer-events-none opacity-0' : 'opacity-100']">
         <Loader2 class="mr-2 size-4 animate-spin" />
         {{ t("pluginPlatform.loadingTitle", { title }) }}
       </div>
     </template>
+    <!-- Plugin AI generation consent (E2): destination, outgoing-text preview
+         (first line + byte size + workbench context) and a workbench-session
+         "don't ask again" option. -->
+    <div v-if="aiConfirmDialog" class="absolute inset-0 z-20 flex items-center justify-center bg-black/40 p-4">
+      <div class="w-full max-w-md rounded-xl border border-border bg-background p-4 shadow-lg">
+        <h3 class="text-sm font-semibold text-foreground">{{ aiConfirmDialog.title }}</h3>
+        <p class="mt-2 text-sm text-muted-foreground">{{ aiConfirmDialog.message }}</p>
+        <div class="mt-3 rounded-lg border border-border bg-muted/40 p-3">
+          <p class="text-xs font-medium text-muted-foreground">{{ aiConfirmDialog.previewHeading }}</p>
+          <pre data-testid="plugin-ai-confirm-preview" class="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all font-mono text-xs text-foreground">{{ aiConfirmDialog.preview.firstLine || "…" }}</pre>
+          <p class="mt-1 text-xs text-muted-foreground">{{ aiConfirmDialog.sizeLabel }}</p>
+          <p v-if="aiConfirmDialog.contextLabel" class="mt-0.5 text-xs text-muted-foreground">{{ aiConfirmDialog.contextLabel }}</p>
+        </div>
+        <label class="mt-3 flex cursor-pointer items-center gap-2 text-sm text-foreground">
+          <input v-model="aiConfirmRemember" type="checkbox" data-testid="plugin-ai-confirm-remember" class="size-4 accent-[var(--color-primary)]" />
+          {{ aiConfirmDialog.rememberLabel }}
+        </label>
+        <div class="mt-4 flex justify-end gap-2">
+          <button data-testid="plugin-ai-confirm-cancel" class="rounded-md border border-border px-3 py-1.5 text-sm text-foreground hover:bg-muted" @click="resolveAiGenerationConfirm(false)">{{ aiConfirmDialog.cancelLabel }}</button>
+          <button data-testid="plugin-ai-confirm-continue" class="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90" @click="resolveAiGenerationConfirm(true)">{{ aiConfirmDialog.continueLabel }}</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>

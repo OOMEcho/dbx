@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 import az from "../locales/az";
 import en from "../locales/en";
 import es from "../locales/es";
+import id from "../locales/id";
 import itLocale from "../locales/it";
 import ja from "../locales/ja";
 import ko from "../locales/ko";
 import ptBR from "../locales/pt-BR";
 import ru from "../locales/ru";
 import tr from "../locales/tr";
+import th from "../locales/th";
 import zhCN from "../locales/zh-CN";
 import zhTW from "../locales/zh-TW";
 
@@ -24,12 +26,14 @@ import zhTW from "../locales/zh-TW";
 const locales: Array<[string, Record<string, unknown>]> = [
   ["az", az as Record<string, unknown>],
   ["es", es as Record<string, unknown>],
+  ["id", id as Record<string, unknown>],
   ["it", itLocale as Record<string, unknown>],
   ["ja", ja as Record<string, unknown>],
   ["ko", ko as Record<string, unknown>],
   ["pt-BR", ptBR as Record<string, unknown>],
   ["ru", ru as Record<string, unknown>],
   ["tr", tr as Record<string, unknown>],
+  ["th", th as Record<string, unknown>],
   ["zh-CN", zhCN as Record<string, unknown>],
   ["zh-TW", zhTW as Record<string, unknown>],
 ];
@@ -76,6 +80,21 @@ function interpolationPlaceholders(message: string): Set<string> {
 const englishMessages = flattenMessages(en as Record<string, unknown>);
 
 describe("locale interpolation placeholder parity", () => {
+  it.each(locales)("%s localizes the routine rename preview", (_name, messages) => {
+    const key = "objects.routineRenamePreview";
+    const localized = flattenMessages(messages).get(key);
+    expect(localized).toBeDefined();
+    expect(localized).not.toBe(englishMessages.get(key));
+  });
+
+  it.each(locales)("%s localizes the table rename repair flow", (_name, messages) => {
+    const localizedMessages = flattenMessages(messages);
+    for (const key of ["objects.tableRenameCoverage", "objects.tableRenameObjects", "objects.tableRenameDraft", "objects.tableRenameSuccess"]) {
+      expect(localizedMessages.get(key), key).toBeDefined();
+      expect(localizedMessages.get(key), key).not.toBe(englishMessages.get(key));
+    }
+  });
+
   it.each(locales)("%s declares no placeholder English does not", (_name, messages) => {
     const offenders: string[] = [];
     for (const [key, value] of flattenMessages(messages)) {

@@ -3,6 +3,9 @@ pub use dbx_drivers::runtime_config::{
     DUCKDB_WORKER_MAX_PROCESSES_MIN,
 };
 
+mod type_execution_receipts;
+pub use type_execution_receipts::{TypeExecutionBinding, TypeRecoveryContext};
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -16,14 +19,18 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(feature = "mq-admin")]
+use dbx_types::mqtt::{MqttMessage, MqttMessageDirection};
+
 use crate::ai::{
     AiChatMessage, AiChatSelectionState, AiConfig, AiConfigItem, AiConversation, AiProvider, AiRun, AiRunFifoCategory,
     AiRunStatus,
 };
 use crate::connection_secrets::{
-    plugin_connection_secret_key, CASSANDRA_KEYSTORE_PASSWORD_KEY, CASSANDRA_TLS_SECRET_PREFIX,
-    CASSANDRA_TRUSTSTORE_PASSWORD_KEY, MQTT_AUTH_PASSWORD_KEY, MQTT_AUTH_SECRET_PREFIX, MQ_AUTH_API_KEY_VALUE_KEY,
-    MQ_AUTH_CLIENT_SECRET_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_SECRET_PREFIX, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY,
+    is_rocketmq_connection, normalize_rocketmq_credentials, plugin_connection_secret_key,
+    CASSANDRA_KEYSTORE_PASSWORD_KEY, CASSANDRA_TLS_SECRET_PREFIX, CASSANDRA_TRUSTSTORE_PASSWORD_KEY,
+    MQTT_AUTH_PASSWORD_KEY, MQTT_AUTH_SECRET_PREFIX, MQ_AUTH_API_KEY_VALUE_KEY, MQ_AUTH_CLIENT_SECRET_KEY,
+    MQ_AUTH_PASSWORD_KEY, MQ_AUTH_SECRET_PREFIX, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY,
     MQ_TOKEN_SIGNING_SECRET_PREFIX, NACOS_AUTH_PASSWORD_KEY, NACOS_AUTH_SECRET_PREFIX,
     NACOS_RNACOS_CONSOLE_PASSWORD_KEY, PLUGIN_CONNECTION_SECRET_PREFIX, SALESFORCE_AUTH_CLIENT_SECRET_KEY,
     SALESFORCE_AUTH_PASSWORD_KEY, SALESFORCE_AUTH_REFRESH_TOKEN_KEY, SALESFORCE_AUTH_SECRET_PREFIX,
@@ -36,6 +43,12 @@ use crate::history::{
 use crate::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType, TransportLayerConfig};
 use crate::persistence::secret_codec::{
     key_file_candidates, SecretCodec, SecretKeyPolicy, SecretKeyResolution, SecretKeySource,
+};
+use crate::persistence::task_history::{
+    RowCountState, TaskEndpointSnapshot, TaskHistoryStorageError, TaskItemKind, TaskItemStatus, TaskLifecycleOwner,
+    TaskRun, TaskRunCursor, TaskRunDetail, TaskRunItem, TaskRunItemsPage, TaskRunItemsQuery, TaskRunListQuery,
+    TaskRunPage, TaskRunStatus, TaskType, TransferObjectSelectionMode, TransferRunContent, TransferRunDetails,
+    TransferRunMode, TransferRunOwnershipPolicy, TransferRunTargetTableNameCase,
 };
 use crate::prompt_template::PromptTemplate;
 use crate::saved_sql::{SavedSqlFile, SavedSqlFolder, SavedSqlLibrary};
@@ -55,6 +68,29 @@ const APP_STATE_SAVED_SQL_EDITOR_POSITIONS_KEY: &str = "saved_sql_editor_positio
 const APP_STATE_TRANSFER_TASK_LIBRARY_KEY: &str = "transfer_task_library";
 const APP_APPEARANCE_SETTINGS_KEY: &str = "app_appearance";
 const MCP_GLOBAL_POLICY_KEY: &str = "mcp_global_policy";
+/// Policy v2 (`dbx_core::mcp_access::McpAccessPolicy`). Written next to the
+/// v1 key on every save; v1 keeps a never-wider projection for hosts that
+/// only read v1 (an older standalone `dbx-mcp`).
+const MCP_ACCESS_POLICY_KEY: &str = "mcp_access_policy";
+/// Decode the authoritative policy without falling back after corruption.
+fn saved_mcp_access_policy(
+    settings: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<crate::mcp_access::McpAccessPolicy>, String> {
+    let Some(value) = settings.get(MCP_ACCESS_POLICY_KEY) else { return Ok(None) };
+    let mut access: crate::mcp_access::McpAccessPolicy =
+        serde_json::from_value(value.clone()).map_err(|e| format!("invalid MCP access policy: {e}"))?;
+    if access.version != crate::mcp_access::MCP_ACCESS_POLICY_VERSION {
+        return Err(format!("invalid MCP access policy version: {}", access.version));
+    }
+    if let Some(legacy) = settings
+        .get(MCP_GLOBAL_POLICY_KEY)
+        .and_then(|value| serde_json::from_value::<McpGlobalPolicy>(value.clone()).ok())
+    {
+        access.restore_legacy_salesforce_opt_ins(&legacy.normalized());
+    }
+    Ok(Some(access))
+}
+
 const MCP_HTTP_SERVER_SETTINGS_KEY: &str = "mcp_http_server_settings";
 const WEB_MCP_SETTINGS_KEY: &str = "web_mcp_settings";
 const MAX_RETRIES_KEY: &str = "max_retries";
@@ -69,6 +105,10 @@ const AI_PLUGIN_TOOL_PLUGINS_KEY: &str = "ai_plugin_tool_plugins";
 /// excluded even if they reappear on the opt-in list, so a revocation
 /// survives restarts and plugin updates.
 const AI_PLUGIN_TOOL_DISABLED_PLUGINS_KEY: &str = "ai_plugin_tool_disabled_plugins";
+/// `{ pluginId: PluginMcpGrant }` — the user's decisions about a plugin's
+/// tools on the external `dbx` MCP server. Absent entries fall back to the
+/// manifest declaration (see `dbx_core::ai::plugin_mcp`).
+const PLUGIN_MCP_GRANTS_KEY: &str = "plugin_mcp_grants";
 /// `{ pluginId: [connectionId, ...] }` — connections a plugin may read through
 /// the `host.data:read` Host API. Written only after an explicit user consent.
 const PLUGIN_DATA_GRANTS_KEY: &str = "plugin_data_grants";
@@ -77,12 +117,34 @@ const PLUGIN_DATA_GRANTS_KEY: &str = "plugin_data_grants";
 const MAX_PLUGIN_DATA_GRANTS_PER_PLUGIN: usize = 512;
 const APP_STATE_AI_GLOBAL_INSTRUCTIONS_KEY: &str = "ai_global_custom_instructions";
 const APP_STATE_AI_CHAT_SELECTION_KEY: &str = "ai_chat_selection_v1";
+// Keep the existing key so previously persisted publish records remain readable.
+const MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX: &str = "mqtt.sent_history.";
+#[cfg(feature = "mq-admin")]
+const MQTT_MESSAGE_HISTORY_MAX_MESSAGES: usize = 200;
+#[cfg(feature = "mq-admin")]
+const MQTT_MESSAGE_HISTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(feature = "mq-admin")]
+fn mqtt_history_message_identity(message: &MqttMessage) -> (String, String, Option<String>, u8, bool, bool, u64) {
+    (
+        message.topic.clone(),
+        message.payload_base64.clone(),
+        message.payload_text.clone(),
+        message.qos,
+        message.retain,
+        message.direction == MqttMessageDirection::Sent,
+        message.received_at_ms,
+    )
+}
 const SNIPPET_SYNC_IDS_KEY: &str = "snippet_sync_ids";
 const SNIPPET_PENDING_CLEANUPS_KEY: &str = "snippet_pending_legacy_cleanups";
 const USER_DATA_TABLES: &[&str] = &[
     "connections",
     "connection_secrets",
     "history",
+    "task_runs",
+    "transfer_run_details",
+    "task_run_items",
     "ai_config",
     "ai_provider_configs",
     "ai_conversations",
@@ -207,6 +269,45 @@ pub struct Storage {
     /// round-trips to the OS credential store, so hydrating N stored secrets
     /// used to mean N credential-store accesses on the startup path.
     secret_codec_cache: Arc<Mutex<Option<CachedSecretCodec>>>,
+    /// A failed platform lookup is cached for the startup boundary as well.
+    /// Without this, each consumer can prompt a locked Secret Service again.
+    secret_key_error_cache: Arc<Mutex<Option<CachedSecretKeyError>>>,
+    migration_failure: Arc<Mutex<Option<MigrationFailure>>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TunnelProfileSaveSnapshot {
+    pub profiles: Vec<TransportLayerConfig>,
+    metadata: Vec<(String, String)>,
+    secrets: Vec<(String, String, String, Option<String>)>,
+}
+
+impl TunnelProfileSaveSnapshot {
+    pub fn discarded_profile_ids(&self) -> Vec<String> {
+        let mut ids = self
+            .metadata
+            .iter()
+            .filter_map(|(id, json)| match serde_json::from_str::<TransportLayerConfig>(json) {
+                Ok(profile) if profile.id() == id => None,
+                _ => Some(id.clone()),
+            })
+            .collect::<Vec<_>>();
+        for (namespace, key, _, _) in &self.secrets {
+            if let Some(id) = namespace.strip_prefix(TUNNEL_SECRET_NAMESPACE_PREFIX) {
+                if key != CONFIG_SECRET_BLOB_KEY || !self.profiles.iter().any(|profile| profile.id() == id) {
+                    ids.push(id.to_owned());
+                }
+            }
+        }
+        ids.retain(|id| !id.is_empty());
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    fn same_inventory(&self, other: &Self) -> bool {
+        self.metadata == other.metadata && self.secrets == other.secrets
+    }
 }
 
 /// Key material plus the digest of every key file it was resolved from.
@@ -214,6 +315,19 @@ struct CachedSecretCodec {
     codec: SecretCodec,
     key_files: Vec<(PathBuf, Option<[u8; 32]>)>,
 }
+
+struct CachedSecretKeyError {
+    error: String,
+    key_files: Vec<(PathBuf, Option<[u8; 32]>)>,
+}
+
+#[derive(Clone)]
+struct MigrationFailure {
+    code: String,
+    backup_path: Option<String>,
+}
+
+const MIGRATION_LOCK_FILE: &str = ".dbx-secret-migration.lock";
 
 pub const SECRET_STORE_MIGRATION_ID: &str = "secret-store-v1";
 
@@ -252,6 +366,7 @@ pub struct MigrationPreflight {
     pub migration_id: String,
     pub state: MigrationState,
     pub needs_migration: bool,
+    pub key_recovery_required: bool,
     pub key_provider_available: bool,
     pub key_status: MigrationKeyStatus,
     /// Desktop may provision a new local key only for plaintext-only data.
@@ -278,10 +393,9 @@ pub struct MigrationPreflight {
 
 impl MigrationPreflight {
     pub fn is_ready(&self) -> bool {
-        // A brand-new desktop profile has no secrets and may provision its
-        // first key lazily. Strict headless profiles report missing keys as
-        // `needs_migration`, so no additional provider check is needed here.
-        !self.needs_migration && matches!(self.state, MigrationState::Succeeded | MigrationState::NotRequired)
+        !self.needs_migration
+            && !self.key_recovery_required
+            && matches!(self.state, MigrationState::Succeeded | MigrationState::NotRequired)
     }
 }
 
@@ -403,6 +517,8 @@ pub struct TabRuntimeCachePruneResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopSettings {
     pub show_tray_icon: bool,
+    #[serde(default = "default_linux_floating_frame_enabled")]
+    pub linux_floating_frame_enabled: bool,
     pub icon_theme: DesktopIconTheme,
     #[serde(default)]
     pub quit_on_close: bool,
@@ -428,6 +544,13 @@ pub struct DesktopSettings {
     pub custom_ai_skill_root_enabled: bool,
     #[serde(default)]
     pub custom_ai_skill_root: Option<String>,
+    /// "Allow the AI to use skills automatically" (prd 09-30 Req 5). When on,
+    /// the built-in AI receives the skill listing even with nothing selected, so
+    /// the model can pick a skill up on its own. Off by default: a listing costs
+    /// prompt tokens on every request, and the user's selection stays the
+    /// explicit gate.
+    #[serde(default)]
+    pub custom_ai_skill_auto_enabled: bool,
     #[serde(default = "default_sidebar_table_page_size")]
     pub sidebar_table_page_size: usize,
 }
@@ -473,12 +596,69 @@ pub struct AppAppearanceSettingsPatch {
     pub corner_style: Option<String>,
 }
 
+/// Access ceiling the user granted a plugin's tools on the external `dbx`
+/// MCP server. Ordered: `Read < Write < Full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginMcpAccessLevel {
+    Read,
+    Write,
+    Full,
+}
+
+/// The user's external MCP decision for one plugin. Built-in AI access keeps
+/// its own Plugin Center switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginMcpGrant {
+    /// Whether the plugin's tools are exposed on the external MCP server.
+    /// The manifest's `external_tools` remains an upper bound.
+    pub external: bool,
+    /// Highest access level the plugin's tools may reach.
+    pub ceiling: PluginMcpAccessLevel,
+    /// Tools the user has seen and accepted, with the access level each had
+    /// at that moment. A tool that needs more than read access waits for
+    /// confirmation when it is missing here (new after an update) or now
+    /// needs more than the level it was accepted at (escalated).
+    #[serde(default)]
+    pub approved_tools: std::collections::BTreeMap<String, PluginMcpAccessLevel>,
+    /// Tools the user switched off individually.
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+}
+
+impl PluginMcpGrant {
+    pub fn normalized(mut self) -> Self {
+        self.approved_tools = std::mem::take(&mut self.approved_tools)
+            .into_iter()
+            .map(|(tool, level)| (tool.trim().to_string(), level))
+            .filter(|(tool, _)| !tool.is_empty())
+            .take(256)
+            .collect();
+        self.disabled_tools.retain(|tool| !tool.trim().is_empty());
+        for tool in self.disabled_tools.iter_mut() {
+            *tool = tool.trim().to_string();
+        }
+        self.disabled_tools.sort();
+        self.disabled_tools.dedup();
+        self.disabled_tools.truncate(256);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct McpGlobalPolicy {
     pub read_only: bool,
     #[serde(default)]
     pub allow_dangerous_sql: bool,
+    /// Ask the desktop user before high-risk SQL when the effective mode is safe-write.
+    /// This never relaxes read-only, connection, database-scope or production protections.
+    #[serde(default)]
+    pub prompt_high_risk_sql: bool,
+    /// Explicit call safety policy. Missing preserves the legacy boolean's meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_confirmation: Option<crate::mcp_access::McpConfirmPolicy>,
     pub allowed_connection_ids: Option<Vec<String>>,
     /// Stable sidebar group ids whose current descendant connections are
     /// exposed when an explicit connection scope is configured.
@@ -499,6 +679,8 @@ pub struct McpGlobalPolicy {
     pub group_policies: Vec<McpGroupPolicy>,
     #[serde(default)]
     pub query_timeout_secs: Option<u64>,
+    #[serde(default = "crate::mcp_access::McpPluginToolsMode::legacy_default")]
+    pub plugin_tools_mode: crate::mcp_access::McpPluginToolsMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -654,6 +836,11 @@ pub struct McpGlobalPolicyState {
     pub configured: bool,
     pub read_only: bool,
     pub allow_dangerous_sql: bool,
+    #[serde(default)]
+    pub prompt_high_risk_sql: bool,
+    /// Explicit call safety policy. Missing preserves the legacy boolean's meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_confirmation: Option<crate::mcp_access::McpConfirmPolicy>,
     pub allowed_connection_ids: Option<Vec<String>>,
     #[serde(default)]
     pub allowed_group_ids: Vec<String>,
@@ -665,6 +852,8 @@ pub struct McpGlobalPolicyState {
     pub group_policies: Vec<McpGroupPolicy>,
     #[serde(default)]
     pub query_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub plugin_tools_mode: crate::mcp_access::McpPluginToolsMode,
 }
 
 impl McpGlobalPolicyState {
@@ -672,17 +861,28 @@ impl McpGlobalPolicyState {
         McpGlobalPolicy {
             read_only: self.read_only,
             allow_dangerous_sql: self.allow_dangerous_sql,
+            prompt_high_risk_sql: self.prompt_high_risk_sql,
+            call_confirmation: self.call_confirmation,
             allowed_connection_ids: self.allowed_connection_ids.clone(),
             allowed_group_ids: self.allowed_group_ids.clone(),
             allowed_tool_names: self.allowed_tool_names.clone(),
             connection_policies: self.connection_policies.clone(),
             group_policies: self.group_policies.clone(),
             query_timeout_secs: self.query_timeout_secs,
+            plugin_tools_mode: self.plugin_tools_mode,
         }
     }
 }
 
 impl McpGlobalPolicy {
+    pub fn confirmation_policy(&self) -> crate::mcp_access::McpConfirmPolicy {
+        self.call_confirmation.unwrap_or(if self.prompt_high_risk_sql {
+            crate::mcp_access::McpConfirmPolicy::Full
+        } else {
+            crate::mcp_access::McpConfirmPolicy::Off
+        })
+    }
+
     /// Produces the single fail-closed representation persisted by the MCP
     /// policy API. This protects the policy boundary even when a caller does
     /// not use the desktop settings form (for example, a Web API client).
@@ -813,12 +1013,18 @@ impl McpGlobalPolicy {
         Self {
             read_only: self.read_only,
             allow_dangerous_sql: !self.read_only && self.allow_dangerous_sql,
+            // Canonical v1 representation retains old booleans losslessly.
+            // Explicit Off clears legacy elevation; HighRisk never enables it.
+            prompt_high_risk_sql: self.confirmation_policy() == crate::mcp_access::McpConfirmPolicy::Full,
+            call_confirmation: (self.confirmation_policy() == crate::mcp_access::McpConfirmPolicy::HighRisk)
+                .then_some(crate::mcp_access::McpConfirmPolicy::HighRisk),
             allowed_connection_ids,
             allowed_group_ids,
             allowed_tool_names,
             connection_policies,
             group_policies,
             query_timeout_secs: self.query_timeout_secs,
+            plugin_tools_mode: self.plugin_tools_mode,
         }
     }
 }
@@ -936,10 +1142,15 @@ pub fn default_duckdb_worker_max_processes() -> usize {
     DUCKDB_WORKER_MAX_PROCESSES_DEFAULT
 }
 
+fn default_linux_floating_frame_enabled() -> bool {
+    true
+}
+
 impl Default for DesktopSettings {
     fn default() -> Self {
         Self {
             show_tray_icon: true,
+            linux_floating_frame_enabled: true,
             icon_theme: DesktopIconTheme::Default,
             quit_on_close: false,
             close_action_prompted: false,
@@ -953,6 +1164,7 @@ impl Default for DesktopSettings {
             agent_store_dir: None,
             custom_ai_skill_root_enabled: false,
             custom_ai_skill_root: None,
+            custom_ai_skill_auto_enabled: false,
             sidebar_table_page_size: default_sidebar_table_page_size(),
         }
     }
@@ -1019,6 +1231,62 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         ,mcp_response_json TEXT
         ,mcp_session_id TEXT
     )",
+    "CREATE TABLE IF NOT EXISTS task_runs (
+        run_id TEXT PRIMARY KEY NOT NULL,
+        task_type TEXT NOT NULL,
+        lifecycle_owner TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        owner_instance_id TEXT NOT NULL,
+        error_code TEXT,
+        safe_error_summary TEXT,
+        history_complete INTEGER NOT NULL DEFAULT 0,
+        source_connection_id TEXT NOT NULL,
+        source_database_type TEXT NOT NULL,
+        source_database TEXT NOT NULL,
+        source_schema TEXT NOT NULL,
+        source_catalog TEXT,
+        target_connection_id TEXT NOT NULL,
+        target_database_type TEXT NOT NULL,
+        target_database TEXT NOT NULL,
+        target_schema TEXT NOT NULL,
+        target_catalog TEXT
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_task_runs_created ON task_runs(created_at DESC, run_id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_task_runs_type_status_created ON task_runs(task_type, status, created_at DESC, run_id DESC)",
+    "CREATE TABLE IF NOT EXISTS transfer_run_details (
+        run_id TEXT PRIMARY KEY NOT NULL,
+        content TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        batch_size INTEGER NOT NULL,
+        create_table INTEGER NOT NULL,
+        drop_target_before_create INTEGER NOT NULL,
+        target_table_name_case TEXT NOT NULL,
+        quote_target_column_names INTEGER NOT NULL,
+        ownership_policy TEXT NOT NULL,
+        filtered_table_count INTEGER NOT NULL,
+        table_total INTEGER NOT NULL,
+        object_selection_mode TEXT NOT NULL,
+        selected_object_count INTEGER
+    )",
+    "CREATE TABLE IF NOT EXISTS task_run_items (
+        run_id TEXT NOT NULL,
+        item_index INTEGER NOT NULL,
+        item_kind TEXT NOT NULL,
+        source_object TEXT NOT NULL,
+        target_object TEXT NOT NULL,
+        status TEXT NOT NULL,
+        source_row_count INTEGER,
+        moved_row_count INTEGER,
+        target_row_count INTEGER,
+        row_count_state TEXT NOT NULL,
+        has_table_filter INTEGER NOT NULL DEFAULT 0,
+        safe_error_summary TEXT,
+        PRIMARY KEY (run_id, item_index)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_task_run_items_run_status ON task_run_items(run_id, status, item_index)",
     "CREATE TABLE IF NOT EXISTS ai_config (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         config_json TEXT NOT NULL
@@ -1041,6 +1309,8 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         messages_json TEXT NOT NULL DEFAULT '[]',
         queued_input TEXT,
         plugin_context_json TEXT,
+        assistant_mode TEXT,
+        assistant_action TEXT,
         created_at TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL DEFAULT ''
     )",
@@ -1123,6 +1393,7 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         updated_at TEXT NOT NULL DEFAULT ''
     )",
     "CREATE TABLE IF NOT EXISTS saved_sql_files (
+        is_default_query INTEGER NOT NULL DEFAULT 0,
         id TEXT PRIMARY KEY,
         connection_id TEXT NOT NULL,
         folder_id TEXT,
@@ -1182,7 +1453,15 @@ fn migration_backup_paths(counts: &serde_json::Value) -> Result<Vec<String>, Str
 }
 
 fn migration_error_code(error: &str) -> &'static str {
-    if error.contains("MISSING_MANAGED_KEY") {
+    if error.contains("MIGRATION_STATE_WRITE_FAILED") {
+        "MIGRATION_STATE_WRITE_FAILED"
+    } else if error.contains("MIGRATION_RESTORE_FAILED") {
+        "MIGRATION_RESTORE_FAILED"
+    } else if error.contains("MIGRATION_INTERRUPTED") {
+        "MIGRATION_INTERRUPTED"
+    } else if error.contains("BACKUP_FAILED") {
+        "BACKUP_FAILED"
+    } else if error.contains("MISSING_MANAGED_KEY") {
         "MISSING_MANAGED_KEY"
     } else if error.contains("ENCRYPTED_DATA_KEY_MISSING") {
         "ENCRYPTED_DATA_KEY_MISSING"
@@ -1192,6 +1471,10 @@ fn migration_error_code(error: &str) -> &'static str {
         "SECRET_KEY_INVALID"
     } else if error.contains("KEY_FILE_UNAVAILABLE") {
         "KEY_FILE_UNAVAILABLE"
+    } else if error.contains("KEYRING_ACCESS_FAILED") {
+        "KEYRING_ACCESS_FAILED"
+    } else if error.contains("KEYRING_WRITE_FAILED") {
+        "KEYRING_WRITE_FAILED"
     } else if error.contains("MISSING_EXTERNAL_KEY") || error.contains("MISSING_PERSISTENT_KEY") {
         "MISSING_EXTERNAL_KEY"
     } else if error.contains("KEY_PROVIDER_UNAVAILABLE") {
@@ -1209,11 +1492,22 @@ fn migration_error_code(error: &str) -> &'static str {
 
 fn migration_safe_message(code: &str, _error: &str) -> String {
     match code {
+        "MIGRATION_STATE_WRITE_FAILED" => {
+            "Could not save the migration failure status; keep the backup and retry".to_string()
+        }
+        "MIGRATION_RESTORE_FAILED" => "Could not restore the database backup; keep the backup for recovery".to_string(),
+        "MIGRATION_INTERRUPTED" => "The previous migration was interrupted; keep the backup and retry".to_string(),
         "MISSING_MANAGED_KEY" => "A managed data-directory secret key is required".to_string(),
         "ENCRYPTED_DATA_KEY_MISSING" => "The key for existing encrypted data is missing".to_string(),
         "SECRET_KEY_MISMATCH" => "The configured secret key cannot decrypt existing data".to_string(),
         "SECRET_KEY_INVALID" => "The configured secret key is invalid".to_string(),
         "KEY_FILE_UNAVAILABLE" => "The configured secret key file is unavailable".to_string(),
+        "KEYRING_ACCESS_FAILED" => {
+            "The platform credential store refused access to the DBX secret-store key".to_string()
+        }
+        "KEYRING_WRITE_FAILED" => {
+            "DBX could not save the secret-store key in the platform credential store".to_string()
+        }
         "MISSING_EXTERNAL_KEY" => "An external secret key is required".to_string(),
         "BACKUP_FAILED" => "Could not create a migration backup".to_string(),
         "LEGACY_JSON_INVALID" => "A legacy configuration file could not be read".to_string(),
@@ -1269,6 +1563,8 @@ impl Storage {
             secret_key_policy: SecretKeyPolicy::PlatformDefault,
             secret_key_creation_allowed: true,
             secret_codec_cache: Arc::new(Mutex::new(None)),
+            secret_key_error_cache: Arc::new(Mutex::new(None)),
+            migration_failure: Arc::new(Mutex::new(None)),
         };
         // Best-effort: switching journal mode is itself a lock-sensitive
         // operation, so a transient failure here (e.g. another process
@@ -1296,6 +1592,44 @@ impl Storage {
         self
     }
 
+    pub async fn prepare_portable_secret_key(&self) -> Result<bool, String> {
+        self.prepare_portable_secret_key_with(SecretCodec::from_platform_store).await
+    }
+
+    async fn prepare_portable_secret_key_with<F>(&self, platform_key: F) -> Result<bool, String>
+    where
+        F: FnOnce() -> Result<Option<SecretCodec>, String>,
+    {
+        if !matches!(self.secret_key_policy, SecretKeyPolicy::ManagedDataDir) {
+            return Err("Portable key preparation requires a managed data-directory key".to_string());
+        }
+        match SecretCodec::resolve(SecretKeyPolicy::ManagedDataDir, self.data_dir(), false) {
+            Ok(_) => return Ok(false),
+            Err(error) if error == "MISSING_MANAGED_KEY" => {}
+            Err(error) => return Err(error),
+        }
+        let has_ciphertext = self
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM connection_secrets WHERE secret_enc IS NOT NULL AND secret_enc <> '')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .await?;
+        if !has_ciphertext {
+            return Ok(false);
+        }
+        let Some(codec) = platform_key()? else {
+            return Ok(false);
+        };
+        self.validate_existing_encrypted_data(codec).await.map_err(|_| "SECRET_KEY_MISMATCH".to_string())?;
+        codec.persist_managed_data_dir_key(self.data_dir())?;
+        self.invalidate_secret_codec();
+        Ok(true)
+    }
+
     /// Compatibility builder for callers that require an externally managed key.
     pub fn require_persistent_key(self) -> Self {
         self.with_secret_key_policy(SecretKeyPolicy::ExternalOnly)
@@ -1306,7 +1640,35 @@ impl Storage {
     }
 
     fn resolve_secret_key(&self, allow_create: bool) -> Result<SecretKeyResolution, String> {
-        SecretCodec::resolve(self.secret_key_policy, self.data_dir(), allow_create)
+        self.resolve_secret_key_with_error_cache(allow_create, true)
+    }
+
+    fn resolve_secret_key_with_error_cache(
+        &self,
+        allow_create: bool,
+        use_cached_error: bool,
+    ) -> Result<SecretKeyResolution, String> {
+        if !allow_create && use_cached_error {
+            let key_files = self.key_file_digests();
+            let mut cache = self.secret_key_error_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = cache.as_ref() {
+                if cached.key_files == key_files {
+                    return Err(cached.error.clone());
+                }
+                *cache = None;
+            }
+        }
+        let resolved = SecretCodec::resolve(self.secret_key_policy, self.data_dir(), allow_create)?;
+        // A fresh successful resolve supersedes any cached failure recorded
+        // while the platform store was locked or unavailable, so read-only
+        // callers stop serving the stale error once the provider recovers.
+        *self.secret_key_error_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        Ok(resolved)
+    }
+
+    fn cache_secret_key_error(&self, error: &str, key_files: Vec<(PathBuf, Option<[u8; 32]>)>) {
+        *self.secret_key_error_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(CachedSecretKeyError { error: error.to_string(), key_files });
     }
 
     /// Resolution cost is dominated by the platform credential store, so the
@@ -1324,9 +1686,7 @@ impl Storage {
         // files are unchanged across the resolve. A pair taken after resolving
         // could combine a stale codec with fresh digests, which the use-time
         // digest check would then never reject.
-        if self.key_file_digests() == key_files {
-            self.cache_secret_codec(codec, key_files);
-        }
+        self.cache_secret_codec_if_unchanged(codec, key_files);
         Ok(codec)
     }
 
@@ -1348,8 +1708,17 @@ impl Storage {
         *self.secret_codec_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entry);
     }
 
+    fn cache_secret_codec_if_unchanged(&self, codec: SecretCodec, before: Vec<(PathBuf, Option<[u8; 32]>)>) {
+        if self.key_file_digests() == before {
+            self.cache_secret_codec(codec, before);
+        } else {
+            self.invalidate_secret_codec();
+        }
+    }
+
     fn invalidate_secret_codec(&self) {
         *self.secret_codec_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self.secret_key_error_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Digest of every file that can supply key material on its own. Comparing
@@ -1391,6 +1760,35 @@ impl Storage {
                         .map_err(|error| error.to_string())
                     })
                     .await?;
+                if has_ciphertext {
+                    return Err("ENCRYPTED_DATA_KEY_MISSING".to_string());
+                }
+                self.secret_codec(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn secret_codec_for_write_in_conn(&self, conn: &Connection, needs_key: bool) -> Result<SecretCodec, String> {
+        match self.secret_codec(false) {
+            Ok(codec) => Ok(codec),
+            Err(error)
+                if matches!(
+                    error.as_str(),
+                    "MISSING_MANAGED_KEY" | "MISSING_EXTERNAL_KEY" | "KEY_PROVIDER_UNAVAILABLE"
+                ) =>
+            {
+                if !needs_key {
+                    return Ok(SecretCodec::new([0u8; 32]));
+                }
+                if !self.secret_key_creation_allowed {
+                    return Err(error);
+                }
+                let has_ciphertext = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM connection_secrets WHERE secret_enc IS NOT NULL AND secret_enc <> '')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                ).map_err(|error| error.to_string())?;
                 if has_ciphertext {
                     return Err("ENCRYPTED_DATA_KEY_MISSING".to_string());
                 }
@@ -1488,8 +1886,35 @@ impl Storage {
     }
 
     pub async fn inspect_data_migration(&self) -> Result<MigrationPreflight, String> {
+        self.inspect_data_migration_with_error_cache(true).await
+    }
+
+    /// Repeat the read-only migration probe after an explicit user action.
+    /// Only this call bypasses a cached provider failure; its success or error
+    /// replaces that cache before ordinary startup/background reads resume.
+    pub async fn retry_data_migration_inspection(&self) -> Result<MigrationPreflight, String> {
+        self.inspect_data_migration_with_error_cache(false).await
+    }
+
+    async fn inspect_data_migration_with_error_cache(
+        &self,
+        use_cached_key_error: bool,
+    ) -> Result<MigrationPreflight, String> {
         let files = self.legacy_json_files().await?;
-        let stored = self.load_migration_state().await?;
+        let mut stored = self.load_migration_state().await?;
+        let failure = self.migration_failure.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(failure) = failure {
+            stored.state = MigrationState::Failed;
+            stored.error_message = Some(migration_safe_message(&failure.code, ""));
+            stored.error_code = Some(failure.code);
+            stored.backup_path = failure.backup_path.or(stored.backup_path);
+        } else if stored.state == MigrationState::Running && !self.migration_is_active()? {
+            // A process exit releases the lock. Report interruption without
+            // modifying the database during a status request.
+            stored.state = MigrationState::Failed;
+            stored.error_code = Some("MIGRATION_INTERRUPTED".to_string());
+            stored.error_message = Some(migration_safe_message("MIGRATION_INTERRUPTED", ""));
+        }
         let current_fingerprint = self.migration_source_fingerprint().await?;
         let cached_scan: Option<(i64, i64, i64, i64, i64, i64, i64)> =
             if stored.source_fingerprint.as_deref() == Some(current_fingerprint.as_str()) {
@@ -1581,7 +2006,13 @@ impl Storage {
         };
         // This probe is deliberately read-only. It must not create a keyring
         // entry, key file, or change permissions while displaying status.
-        let key_probe = self.resolve_secret_key(false);
+        let key_files_before = self.key_file_digests();
+        let key_probe = self.resolve_secret_key_with_error_cache(false, use_cached_key_error);
+        if let Err(error) = key_probe.as_ref() {
+            // Keep one startup probe from being repeated by each subsequent
+            // storage read while the desktop keyring is locked or unavailable.
+            self.cache_secret_key_error(error, key_files_before.clone());
+        }
         let mut key_provider_available = key_probe.is_ok();
         let database_plaintext_count = (plaintext + ai + tunnels).max(0) as usize;
         let has_legacy_data =
@@ -1593,7 +2024,7 @@ impl Storage {
             && !matches!(self.secret_key_policy, SecretKeyPolicy::ExternalOnly)
             && encrypted == 0
             && (database_plaintext_count > 0 || sync_credentials > 0 || files.iter().any(|file| file.exists));
-        let mut key_error_code = key_probe.as_ref().err().cloned();
+        let mut key_error_code = key_probe.as_ref().err().map(|error| migration_error_code(error).to_string());
         if let Ok(resolved) = key_probe.as_ref() {
             if encrypted > 0 && self.validate_existing_encrypted_data(resolved.codec).await.is_err() {
                 key_provider_available = false;
@@ -1619,6 +2050,8 @@ impl Storage {
                 "SECRET_KEY_INVALID"
                     | "SECRET_KEY_MISMATCH"
                     | "KEY_FILE_UNAVAILABLE"
+                    | "KEYRING_ACCESS_FAILED"
+                    | "KEYRING_WRITE_FAILED"
                     | "MISSING_EXTERNAL_KEY"
                     | "ENCRYPTED_DATA_KEY_MISSING"
             )
@@ -1635,11 +2068,14 @@ impl Storage {
             None => MigrationKeyStatus::Unavailable,
         };
         let source_changed = stored.source_fingerprint.as_deref().is_some_and(|value| value != current_fingerprint);
-        let state = if fatal_key_error
-            || missing_required_key
-            || missing_existing_key
-            || (has_legacy_data
-                && (source_changed || matches!(stored.state, MigrationState::Succeeded | MigrationState::NotRequired)))
+        let state = if matches!(stored.state, MigrationState::Failed | MigrationState::Running) {
+            stored.state.clone()
+        } else if has_legacy_data
+            && (fatal_key_error
+                || missing_required_key
+                || missing_existing_key
+                || source_changed
+                || matches!(stored.state, MigrationState::Succeeded | MigrationState::NotRequired))
         {
             MigrationState::Pending
         } else if !has_legacy_data && matches!(stored.state, MigrationState::Pending) {
@@ -1647,11 +2083,10 @@ impl Storage {
         } else {
             stored.state.clone()
         };
-        let needs_migration = fatal_key_error
-            || missing_required_key
-            || missing_existing_key
-            || matches!(state, MigrationState::Failed | MigrationState::Running)
+        let needs_migration = matches!(state, MigrationState::Failed | MigrationState::Running)
             || (has_legacy_data && !matches!(state, MigrationState::Succeeded | MigrationState::NotRequired));
+        let key_recovery_required =
+            !needs_migration && (fatal_key_error || missing_required_key || missing_existing_key);
         let (error_code, error_message) = if let Some(code) = key_error_code.clone() {
             let message = match code.as_str() {
                 "MISSING_MANAGED_KEY" => {
@@ -1661,10 +2096,16 @@ impl Storage {
                 "SECRET_KEY_INVALID" => "The configured secret key is invalid",
                 "SECRET_KEY_MISMATCH" => "The configured secret key cannot decrypt existing data",
                 "KEY_FILE_UNAVAILABLE" => "The configured secret key file is unavailable",
+                "KEYRING_ACCESS_FAILED" => "The platform credential store refused access to the DBX secret-store key",
+                "KEYRING_WRITE_FAILED" => "DBX could not save the secret-store key in the platform credential store",
                 "MISSING_EXTERNAL_KEY" => "An external secret key is required",
                 _ => "The local secret provider is unavailable",
             };
             (Some(code), Some(message.to_string()))
+        } else if stored.state == MigrationState::Failed && stored.error_code.is_some() {
+            let code = migration_error_code(stored.error_code.as_deref().unwrap()).to_string();
+            let message = migration_safe_message(&code, "");
+            (Some(code), Some(message))
         } else if missing_required_key {
             (Some("MISSING_EXTERNAL_KEY".to_string()), Some("An external secret key is required".to_string()))
         } else if missing_existing_key {
@@ -1680,10 +2121,19 @@ impl Storage {
             .map(|resolved| resolved.source.as_str())
             .unwrap_or(SecretKeySource::Unavailable.as_str())
             .to_string();
+        // Reuse a successful read during the subsequent migration start. This
+        // keeps the read-only preflight and the first migration write from
+        // prompting the platform credential store twice in one action.
+        if key_provider_available {
+            if let Ok(resolved) = key_probe.as_ref() {
+                self.cache_secret_codec_if_unchanged(resolved.codec, key_files_before);
+            }
+        }
         let preflight = MigrationPreflight {
             migration_id: SECRET_STORE_MIGRATION_ID.to_string(),
             state,
             needs_migration,
+            key_recovery_required,
             key_provider_available,
             key_status,
             key_creation_allowed,
@@ -1730,43 +2180,77 @@ impl Storage {
         .await
     }
 
-    pub async fn start_data_migration(&self) -> Result<MigrationReport, String> {
-        let lock = DATA_MIGRATION_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
-        // Migration may create or replace key material, so the codec resolved
-        // for earlier reads must not be reused here.
-        self.invalidate_secret_codec();
-        let preflight = self.inspect_data_migration().await?;
-        if preflight.is_ready() {
-            return Ok(MigrationReport {
-                migration_id: SECRET_STORE_MIGRATION_ID.to_string(),
-                state: preflight.state,
-                backup_path: preflight.backup_path,
-                database_plaintext_count: 0,
-                legacy_json_files: Vec::new(),
-                verified_secret_count: 0,
-                error_code: None,
-                error_message: None,
-            });
+    fn migration_is_active(&self) -> Result<bool, String> {
+        let file =
+            match std::fs::OpenOptions::new().read(true).write(true).open(self.data_dir().join(MIGRATION_LOCK_FILE)) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(_) => return Err("MIGRATION_LOCK_UNAVAILABLE".to_string()),
+            };
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(false), // Closing the handle releases the probe lock.
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(_) => Err("MIGRATION_LOCK_UNAVAILABLE".to_string()),
         }
-        if !preflight.key_provider_available && !preflight.key_creation_allowed {
-            let code = preflight.error_code.as_deref().unwrap_or("KEY_PROVIDER_UNAVAILABLE");
-            let error = code.to_string();
-            self.set_migration_state(MigrationState::Failed, None, Some(code), Some(&error), None).await?;
-            return Err(error);
+    }
+
+    fn lock_data_migration(&self) -> Result<std::fs::File, String> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        self.set_migration_state(MigrationState::Running, None, None, None, Some(&migration_counts_json(&preflight)))
-            .await?;
-        let backup_path = match self.create_migration_backup().await {
-            Ok(path) => path,
-            Err(error) => {
-                let _ = self
-                    .set_migration_state(MigrationState::Failed, None, Some("BACKUP_FAILED"), Some(&error), None)
-                    .await;
-                return Err(error);
+        let file = options
+            .open(self.data_dir().join(MIGRATION_LOCK_FILE))
+            .map_err(|_| "MIGRATION_LOCK_UNAVAILABLE".to_string())?;
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                "MIGRATION_IN_PROGRESS".to_string()
+            } else {
+                "MIGRATION_LOCK_UNAVAILABLE".to_string()
             }
-        };
-        self.set_migration_state(MigrationState::Running, Some(&backup_path), None, None, None).await?;
+        })?;
+        Ok(file)
+    }
+
+    pub async fn start_data_migration(&self) -> Result<MigrationReport, String> {
+        let _lock = DATA_MIGRATION_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+        let _file_lock = self.lock_data_migration()?;
+        *self.migration_failure.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.invalidate_secret_codec();
+        let mut backup_path: Option<String> = None;
+        let mut data_started = false;
         let result = async {
+            let preflight = self.inspect_data_migration().await?;
+            if preflight.is_ready() {
+                return Ok(MigrationReport {
+                    migration_id: SECRET_STORE_MIGRATION_ID.to_string(),
+                    state: preflight.state,
+                    backup_path: preflight.backup_path,
+                    database_plaintext_count: 0,
+                    legacy_json_files: Vec::new(),
+                    verified_secret_count: 0,
+                    error_code: None,
+                    error_message: None,
+                });
+            }
+            if !preflight.key_provider_available && !preflight.key_creation_allowed {
+                return Err(preflight.error_code.unwrap_or_else(|| "KEY_PROVIDER_UNAVAILABLE".to_string()));
+            }
+            self.set_migration_state(
+                MigrationState::Running,
+                None,
+                None,
+                None,
+                Some(&migration_counts_json(&preflight)),
+            )
+            .await?;
+            backup_path = Some(self.create_migration_backup().await.map_err(|_| "BACKUP_FAILED".to_string())?);
+            let backup_path = backup_path.as_deref().unwrap();
+            self.set_migration_state(MigrationState::Running, Some(backup_path), None, None, None).await?;
+            data_started = true;
             let codec = self.secret_codec(preflight.key_creation_allowed)?;
             self.run_database_legacy_migrations(&codec).await?;
             self.migrate_from_json_staged(self.data_dir()).await?;
@@ -1774,7 +2258,7 @@ impl Storage {
             let renamed = self.finalize_legacy_json_files().await?;
             self.set_migration_state(
                 MigrationState::Succeeded,
-                Some(&backup_path),
+                Some(backup_path),
                 None,
                 None,
                 Some(&{
@@ -1796,7 +2280,7 @@ impl Storage {
             Ok::<MigrationReport, String>(MigrationReport {
                 migration_id: SECRET_STORE_MIGRATION_ID.to_string(),
                 state: MigrationState::Succeeded,
-                backup_path: Some(backup_path.clone()),
+                backup_path: Some(backup_path.to_string()),
                 database_plaintext_count: preflight.database_plaintext_count,
                 legacy_json_files: renamed,
                 verified_secret_count: verified,
@@ -1805,24 +2289,37 @@ impl Storage {
             })
         }
         .await;
-        if let Err(error) = &result {
-            // Every database migration helper uses its own transaction. Restore
-            // the pre-migration SQLite snapshot if a later JSON parse, write,
-            // or verification step fails, so the live database is never left
-            // half-upgraded.
-            let _ = self.restore_database_backup(&backup_path).await;
-            let _ = self
-                .set_migration_state(
-                    MigrationState::Failed,
-                    Some(&backup_path),
-                    Some(migration_error_code(error)),
-                    Some(error),
-                    None,
-                )
-                .await;
+        match result {
+            Ok(report) => Ok(report),
+            Err(error) => {
+                self.invalidate_secret_codec();
+                let mut code = migration_error_code(&error).to_string();
+                if data_started {
+                    if let Some(path) = backup_path.as_deref() {
+                        if self.restore_database_backup(path).await.is_err() {
+                            code = "MIGRATION_RESTORE_FAILED".to_string();
+                        }
+                    }
+                }
+                if self
+                    .set_migration_state(MigrationState::Failed, backup_path.as_deref(), Some(&code), Some(&code), None)
+                    .await
+                    .is_err()
+                {
+                    code = "MIGRATION_STATE_WRITE_FAILED".to_string();
+                    // A read-only status request must still report the failed
+                    // action if SQLite cannot persist it. After process exit,
+                    // a retained running record is detected via the file lock.
+                    *self.migration_failure.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some(MigrationFailure { code: code.clone(), backup_path });
+                }
+                if code == "MIGRATION_STATE_WRITE_FAILED" || code == "MIGRATION_RESTORE_FAILED" {
+                    Err(code)
+                } else {
+                    Err(error)
+                }
+            }
         }
-        drop(lock);
-        result
     }
 
     pub async fn retry_data_migration(&self) -> Result<MigrationReport, String> {
@@ -1994,7 +2491,8 @@ impl Storage {
         }
         let counts_json = counts.to_string();
         let backup_path = backup_path.or(previous.backup_path);
-        let source_fingerprint = Some(self.migration_source_fingerprint().await?);
+        let source_fingerprint =
+            if state == "failed" { None } else { Some(self.migration_source_fingerprint().await?) };
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO data_migrations (migration_id,state,source_fingerprint,counts_json,backup_path,error_code,error_message,started_at,completed_at)
@@ -2440,6 +2938,9 @@ fn connection_secret_in_tx_exists(
 }
 
 fn connection_config_has_inline_secrets(config: &ConnectionConfig) -> bool {
+    let mut normalized = config.clone();
+    normalize_rocketmq_credentials(&mut normalized);
+    let config = &normalized;
     if !config.password.is_empty()
         || config.url_params.as_deref().is_some_and(|value| !value.is_empty())
         || config.init_script.as_deref().is_some_and(|value| !value.is_empty())
@@ -2865,6 +3366,7 @@ fn ensure_saved_sql_columns_sync(conn: &Connection) -> Result<(), String> {
     const FOLDER_COLUMNS: &[(&str, &str)] =
         &[("parent_folder_id", "TEXT"), ("order_index", "INTEGER NOT NULL DEFAULT 0")];
     const FILE_COLUMNS: &[(&str, &str)] = &[
+        ("is_default_query", "INTEGER NOT NULL DEFAULT 0"),
         ("catalog_name", "TEXT"),
         ("order_index", "INTEGER NOT NULL DEFAULT 0"),
         ("open_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -2873,6 +3375,12 @@ fn ensure_saved_sql_columns_sync(conn: &Connection) -> Result<(), String> {
 
     ensure_table_columns(conn, "saved_sql_folders", FOLDER_COLUMNS)?;
     ensure_table_columns(conn, "saved_sql_files", FILE_COLUMNS)?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_sql_default_scope
+         ON saved_sql_files(connection_id, COALESCE(catalog_name, ''), database_name)
+         WHERE is_default_query = 1;",
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2925,6 +3433,12 @@ fn ensure_ai_conversations_columns_sync(conn: &Connection) -> Result<(), String>
         // [`backfill_ai_conversation_connections`].
         ("connection_id", "TEXT NOT NULL DEFAULT ''"),
         ("schema_name", "TEXT"),
+        // Per-conversation picker selection (#12075). Plain TEXT and nullable:
+        // a legacy row keeps NULL, which the frontend reads as "no recorded
+        // choice" and resolves through the plugin context and then the settings
+        // default.
+        ("assistant_mode", "TEXT"),
+        ("assistant_action", "TEXT"),
     ];
 
     ensure_table_columns(conn, "ai_conversations", COLUMNS)
@@ -3398,6 +3912,28 @@ fn normalized_string_list(value: Option<&serde_json::Value>) -> Vec<String> {
     values
 }
 
+fn plugin_mcp_grants_from(value: Option<&serde_json::Value>) -> HashMap<String, PluginMcpGrant> {
+    let Some(serde_json::Value::Object(grants)) = value else {
+        return HashMap::new();
+    };
+    grants
+        .iter()
+        .filter_map(|(plugin_id, grant)| {
+            let plugin_id = plugin_id.trim();
+            if plugin_id.is_empty() {
+                return None;
+            }
+            match serde_json::from_value::<PluginMcpGrant>(grant.clone()) {
+                Ok(grant) => Some((plugin_id.to_string(), grant.normalized())),
+                Err(error) => {
+                    warn!("[plugins] ignoring malformed MCP grant for {plugin_id}: {error}");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 fn normalized_setting_id(value: &str, label: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.chars().count() > 256 {
@@ -3650,6 +4186,475 @@ impl Storage {
         })
         .await
     }
+}
+
+impl Storage {
+    pub async fn create_task_run(
+        &self,
+        run: &TaskRun,
+        details: &TransferRunDetails,
+        items: &[TaskRunItem],
+    ) -> Result<(), TaskHistoryStorageError> {
+        let run = run.clone();
+        let details = details.clone();
+        let items = items.to_vec();
+        let inserted = self
+            .with_conn(move |conn| {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| error.to_string())?;
+                let exists = tx
+                    .query_row("SELECT 1 FROM task_runs WHERE run_id = ?1", [&run.run_id], |row| row.get::<_, i64>(0))
+                    .optional()
+                    .map_err(|error| error.to_string())?
+                    .is_some();
+                if exists {
+                    return Ok(false);
+                }
+                tx.execute(
+                    "INSERT INTO task_runs (
+                        run_id, task_type, lifecycle_owner, status, created_at, started_at, finished_at,
+                        owner_instance_id, error_code, safe_error_summary, history_complete,
+                        source_connection_id, source_database_type, source_database, source_schema, source_catalog,
+                        target_connection_id, target_database_type, target_database, target_schema, target_catalog
+                    ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                        ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+                    )",
+                    params![
+                        run.run_id,
+                        run.task_type.as_storage_str(),
+                        run.lifecycle_owner.as_storage_str(),
+                        run.status.as_storage_str(),
+                        run.created_at,
+                        run.started_at,
+                        run.finished_at,
+                        run.owner_instance_id,
+                        run.error_code,
+                        run.safe_error_summary,
+                        run.history_complete,
+                        run.source.connection_id,
+                        run.source.database_type,
+                        run.source.database,
+                        run.source.schema,
+                        run.source.catalog,
+                        run.target.connection_id,
+                        run.target.database_type,
+                        run.target.database,
+                        run.target.schema,
+                        run.target.catalog,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+                tx.execute(
+                    "INSERT INTO transfer_run_details (
+                        run_id, content, mode, batch_size, create_table, drop_target_before_create,
+                        target_table_name_case, quote_target_column_names, ownership_policy,
+                        filtered_table_count, table_total, object_selection_mode, selected_object_count
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        details.run_id,
+                        details.content.as_storage_str(),
+                        details.mode.as_storage_str(),
+                        details.batch_size,
+                        details.create_table,
+                        details.drop_target_before_create,
+                        details.target_table_name_case.as_storage_str(),
+                        details.quote_target_column_names,
+                        details.ownership_policy.as_storage_str(),
+                        details.filtered_table_count,
+                        details.table_total,
+                        details.object_selection_mode.as_storage_str(),
+                        details.selected_object_count,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+                for item in items {
+                    insert_task_run_item(&tx, &item)?;
+                }
+                tx.commit().map_err(|error| error.to_string())?;
+                Ok(true)
+            })
+            .await
+            .map_err(|_| TaskHistoryStorageError::StorageUnavailable)?;
+        if inserted {
+            Ok(())
+        } else {
+            Err(TaskHistoryStorageError::RunIdConflict)
+        }
+    }
+
+    pub async fn save_task_run_item(&self, item: &TaskRunItem) -> Result<bool, TaskHistoryStorageError> {
+        let item = item.clone();
+        self.with_conn(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            let run_status = tx
+                .query_row("SELECT status FROM task_runs WHERE run_id = ?1", [&item.run_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if run_status.as_deref() != Some("running") {
+                return Ok(false);
+            }
+            let changed = tx
+                .execute(
+                    "INSERT INTO task_run_items (
+                        run_id, item_index, item_kind, source_object, target_object, status,
+                        source_row_count, moved_row_count, target_row_count, row_count_state,
+                        has_table_filter, safe_error_summary
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    ON CONFLICT(run_id, item_index) DO UPDATE SET
+                        item_kind = excluded.item_kind,
+                        source_object = excluded.source_object,
+                        target_object = excluded.target_object,
+                        status = excluded.status,
+                        source_row_count = excluded.source_row_count,
+                        moved_row_count = excluded.moved_row_count,
+                        target_row_count = excluded.target_row_count,
+                        row_count_state = excluded.row_count_state,
+                        has_table_filter = excluded.has_table_filter,
+                        safe_error_summary = excluded.safe_error_summary
+                    WHERE task_run_items.status NOT IN ('succeeded', 'skipped', 'failed', 'cancelled', 'not_started', 'incomplete')",
+                    params![
+                        item.run_id,
+                        item.item_index,
+                        item.item_kind.as_storage_str(),
+                        item.source_object,
+                        item.target_object,
+                        item.status.as_storage_str(),
+                        item.source_row_count,
+                        item.moved_row_count,
+                        item.target_row_count,
+                        item.row_count_state.as_storage_str(),
+                        item.has_table_filter,
+                        item.safe_error_summary,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(changed > 0)
+        })
+        .await
+        .map_err(|_| TaskHistoryStorageError::StorageUnavailable)
+    }
+
+    pub async fn finish_task_run(
+        &self,
+        run_id: &str,
+        status: TaskRunStatus,
+        error_code: Option<&str>,
+        safe_error_summary: Option<&str>,
+        history_complete: bool,
+    ) -> Result<bool, TaskHistoryStorageError> {
+        let run_id = run_id.to_string();
+        let error_code = error_code.map(str::to_string);
+        let safe_error_summary = safe_error_summary.map(str::to_string);
+        self.with_conn(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            let current = tx
+                .query_row("SELECT status FROM task_runs WHERE run_id = ?1", [&run_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some(current) = current else {
+                return Err("Task run does not exist".to_string());
+            };
+            if current != "running" {
+                return Ok(false);
+            }
+            if !status.is_terminal() {
+                return Err("A task run cannot be finished with a running status".to_string());
+            }
+            let finished_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let changed = tx
+                .execute(
+                    "UPDATE task_runs SET status = ?2, finished_at = ?3, error_code = ?4,
+                     safe_error_summary = ?5, history_complete = ?6 WHERE run_id = ?1 AND status = 'running'",
+                    params![run_id, status.as_storage_str(), finished_at, error_code, safe_error_summary, history_complete],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE task_run_items SET status = 'not_started'
+                 WHERE run_id = ?1 AND status = 'pending'",
+                [&run_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "UPDATE task_run_items SET status = 'incomplete',
+                    row_count_state = CASE WHEN row_count_state = 'not_applicable' THEN row_count_state ELSE 'incomplete' END,
+                    safe_error_summary = COALESCE(safe_error_summary, ?2)
+                 WHERE run_id = ?1 AND status = 'running'",
+                params![run_id, "Transfer item did not complete."],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(true)
+        })
+        .await
+        .map_err(|_| TaskHistoryStorageError::StorageUnavailable)
+    }
+
+    pub async fn get_task_run_detail(&self, run_id: &str) -> Result<Option<TaskRunDetail>, TaskHistoryStorageError> {
+        let run_id = run_id.to_string();
+        self.with_conn(move |conn| {
+            let run = conn
+                .query_row(
+                    "SELECT run_id, task_type, lifecycle_owner, status, created_at, started_at, finished_at,
+                        owner_instance_id, error_code, safe_error_summary, history_complete,
+                        source_connection_id, source_database_type, source_database, source_schema, source_catalog,
+                        target_connection_id, target_database_type, target_database, target_schema, target_catalog
+                     FROM task_runs WHERE run_id = ?1",
+                    [&run_id],
+                    map_task_run_row,
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some(run) = run else {
+                return Ok(None);
+            };
+            let transfer = conn
+                .query_row(
+                    "SELECT run_id, content, mode, batch_size, create_table, drop_target_before_create,
+                        target_table_name_case, quote_target_column_names, ownership_policy,
+                        filtered_table_count, table_total, object_selection_mode, selected_object_count
+                     FROM transfer_run_details WHERE run_id = ?1",
+                    [&run_id],
+                    map_transfer_run_details_row,
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            Ok(Some(TaskRunDetail { run, transfer }))
+        })
+        .await
+        .map_err(|_| TaskHistoryStorageError::StorageUnavailable)
+    }
+
+    pub async fn list_task_runs(&self, query: TaskRunListQuery) -> Result<TaskRunPage, TaskHistoryStorageError> {
+        self.with_conn(move |conn| {
+            let limit = query.limit.filter(|limit| *limit > 0).unwrap_or(50).clamp(1, 100);
+            let mut predicates = Vec::new();
+            let mut values = Vec::<Value>::new();
+            if let Some(task_type) = query.task_type {
+                predicates.push("task_type = ?".to_string());
+                values.push(Value::Text(task_type.as_storage_str().to_string()));
+            }
+            if let Some(status) = query.status {
+                predicates.push("status = ?".to_string());
+                values.push(Value::Text(status.as_storage_str().to_string()));
+            }
+            if let Some(cursor) = query.cursor {
+                predicates.push("(created_at < ? OR (created_at = ? AND run_id < ?))".to_string());
+                values.push(Value::Text(cursor.created_at.clone()));
+                values.push(Value::Text(cursor.created_at));
+                values.push(Value::Text(cursor.run_id));
+            }
+            let where_clause =
+                if predicates.is_empty() { String::new() } else { format!(" WHERE {}", predicates.join(" AND ")) };
+            let sql = format!(
+                "SELECT run_id, task_type, lifecycle_owner, status, created_at, started_at, finished_at,
+                    owner_instance_id, error_code, safe_error_summary, history_complete,
+                    source_connection_id, source_database_type, source_database, source_schema, source_catalog,
+                    target_connection_id, target_database_type, target_database, target_schema, target_catalog
+                 FROM task_runs{where_clause} ORDER BY created_at DESC, run_id DESC LIMIT ?"
+            );
+            values.push(Value::Integer((limit + 1) as i64));
+            let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+            let rows =
+                stmt.query_map(params_from_iter(values.iter()), map_task_run_row).map_err(|error| error.to_string())?;
+            let mut items = rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            let next_cursor = if has_more {
+                items.last().map(|run| TaskRunCursor { created_at: run.created_at.clone(), run_id: run.run_id.clone() })
+            } else {
+                None
+            };
+            Ok(TaskRunPage { items, next_cursor })
+        })
+        .await
+        .map_err(|_| TaskHistoryStorageError::StorageUnavailable)
+    }
+
+    pub async fn list_task_run_items(
+        &self,
+        run_id: &str,
+        query: TaskRunItemsQuery,
+    ) -> Result<TaskRunItemsPage, TaskHistoryStorageError> {
+        let run_id = run_id.to_string();
+        self.with_conn(move |conn| {
+            let limit = query.limit.filter(|limit| *limit > 0).unwrap_or(100).clamp(1, 200);
+            let after = query.after_item_index.unwrap_or(-1);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT run_id, item_index, item_kind, source_object, target_object, status,
+                        source_row_count, moved_row_count, target_row_count, row_count_state,
+                        has_table_filter, safe_error_summary
+                     FROM task_run_items WHERE run_id = ?1 AND item_index > ?2
+                     ORDER BY item_index ASC LIMIT ?3",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![run_id, after, (limit + 1) as i64], map_task_run_item_row)
+                .map_err(|error| error.to_string())?;
+            let mut items = rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            let next_after_item_index = if has_more { items.last().map(|item| item.item_index) } else { None };
+            Ok(TaskRunItemsPage { items, next_after_item_index })
+        })
+        .await
+        .map_err(|_| TaskHistoryStorageError::StorageUnavailable)
+    }
+
+    pub async fn delete_task_run(&self, run_id: &str) -> Result<bool, TaskHistoryStorageError> {
+        const RUNNING_SENTINEL: &str = "TASK_RUN_STILL_RUNNING";
+        let run_id = run_id.to_string();
+        let result = self
+            .with_conn(move |conn| {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| error.to_string())?;
+                let current = tx
+                    .query_row("SELECT status FROM task_runs WHERE run_id = ?1", [&run_id], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                let Some(current) = current else {
+                    return Ok(false);
+                };
+                if TaskRunStatus::from_storage(&current).is_none_or(|status| !status.is_terminal()) {
+                    return Err(RUNNING_SENTINEL.to_string());
+                }
+                tx.execute("DELETE FROM task_run_items WHERE run_id = ?1", [&run_id])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM transfer_run_details WHERE run_id = ?1", [&run_id])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM task_runs WHERE run_id = ?1", [&run_id]).map_err(|error| error.to_string())?;
+                tx.commit().map_err(|error| error.to_string())?;
+                Ok(true)
+            })
+            .await;
+        match result {
+            Ok(deleted) => Ok(deleted),
+            Err(error) if error == RUNNING_SENTINEL => Err(TaskHistoryStorageError::RunStillRunning),
+            Err(_) => Err(TaskHistoryStorageError::StorageUnavailable),
+        }
+    }
+}
+
+fn insert_task_run_item(tx: &rusqlite::Transaction<'_>, item: &TaskRunItem) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO task_run_items (
+            run_id, item_index, item_kind, source_object, target_object, status,
+            source_row_count, moved_row_count, target_row_count, row_count_state,
+            has_table_filter, safe_error_summary
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            item.run_id,
+            item.item_index,
+            item.item_kind.as_storage_str(),
+            item.source_object,
+            item.target_object,
+            item.status.as_storage_str(),
+            item.source_row_count,
+            item.moved_row_count,
+            item.target_row_count,
+            item.row_count_state.as_storage_str(),
+            item.has_table_filter,
+            item.safe_error_summary,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn map_task_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRun> {
+    let task_type: String = row.get(1)?;
+    let lifecycle_owner: String = row.get(2)?;
+    let status: String = row.get(3)?;
+    Ok(TaskRun {
+        run_id: row.get(0)?,
+        task_type: TaskType::from_storage(&task_type).ok_or(rusqlite::Error::InvalidQuery)?,
+        lifecycle_owner: TaskLifecycleOwner::from_storage(&lifecycle_owner).ok_or(rusqlite::Error::InvalidQuery)?,
+        status: TaskRunStatus::from_storage(&status).ok_or(rusqlite::Error::InvalidQuery)?,
+        created_at: row.get(4)?,
+        started_at: row.get(5)?,
+        finished_at: row.get(6)?,
+        owner_instance_id: row.get(7)?,
+        error_code: row.get(8)?,
+        safe_error_summary: row.get(9)?,
+        history_complete: row.get(10)?,
+        source: TaskEndpointSnapshot {
+            connection_id: row.get(11)?,
+            database_type: row.get(12)?,
+            database: row.get(13)?,
+            schema: row.get(14)?,
+            catalog: row.get(15)?,
+        },
+        target: TaskEndpointSnapshot {
+            connection_id: row.get(16)?,
+            database_type: row.get(17)?,
+            database: row.get(18)?,
+            schema: row.get(19)?,
+            catalog: row.get(20)?,
+        },
+    })
+}
+
+fn map_transfer_run_details_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransferRunDetails> {
+    let content: String = row.get(1)?;
+    let mode: String = row.get(2)?;
+    let table_name_case: String = row.get(6)?;
+    let ownership_policy: String = row.get(8)?;
+    let selection_mode: String = row.get(11)?;
+    Ok(TransferRunDetails {
+        run_id: row.get(0)?,
+        content: TransferRunContent::from_storage(&content).ok_or(rusqlite::Error::InvalidQuery)?,
+        mode: TransferRunMode::from_storage(&mode).ok_or(rusqlite::Error::InvalidQuery)?,
+        batch_size: row.get(3)?,
+        create_table: row.get(4)?,
+        drop_target_before_create: row.get(5)?,
+        target_table_name_case: TransferRunTargetTableNameCase::from_storage(&table_name_case)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+        quote_target_column_names: row.get(7)?,
+        ownership_policy: TransferRunOwnershipPolicy::from_storage(&ownership_policy)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+        filtered_table_count: row.get(9)?,
+        table_total: row.get(10)?,
+        object_selection_mode: TransferObjectSelectionMode::from_storage(&selection_mode)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+        selected_object_count: row.get(12)?,
+    })
+}
+
+fn map_task_run_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRunItem> {
+    let item_kind: String = row.get(2)?;
+    let status: String = row.get(5)?;
+    let row_count_state: String = row.get(9)?;
+    Ok(TaskRunItem {
+        run_id: row.get(0)?,
+        item_index: row.get(1)?,
+        item_kind: TaskItemKind::from_storage(&item_kind).ok_or(rusqlite::Error::InvalidQuery)?,
+        source_object: row.get(3)?,
+        target_object: row.get(4)?,
+        status: TaskItemStatus::from_storage(&status).ok_or(rusqlite::Error::InvalidQuery)?,
+        source_row_count: row.get(6)?,
+        moved_row_count: row.get(7)?,
+        target_row_count: row.get(8)?,
+        row_count_state: RowCountState::from_storage(&row_count_state).ok_or(rusqlite::Error::InvalidQuery)?,
+        has_table_filter: row.get(10)?,
+        safe_error_summary: row.get(11)?,
+    })
 }
 
 // AI Config
@@ -4005,6 +5010,78 @@ impl Storage {
 // Secret Store and hydrated only when a profile is loaded.
 
 impl Storage {
+    pub async fn load_tunnel_profiles_readonly(&self) -> Result<Vec<TransportLayerConfig>, String> {
+        self.load_tunnel_profile_save_snapshot().await.map(|snapshot| snapshot.profiles)
+    }
+
+    pub async fn load_tunnel_profile_save_snapshot(&self) -> Result<TunnelProfileSaveSnapshot, String> {
+        let storage = self.clone();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred).map_err(|e| e.to_string())?;
+            let mut snapshot = Self::tunnel_profile_raw_snapshot(&tx)?;
+            storage.hydrate_tunnel_profile_snapshot(&mut snapshot)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(snapshot)
+        })
+        .await
+    }
+
+    fn tunnel_profile_raw_snapshot(conn: &Connection) -> Result<TunnelProfileSaveSnapshot, String> {
+        let mut stmt =
+            conn.prepare("SELECT id, config_json FROM tunnel_profiles ORDER BY rowid").map_err(|e| e.to_string())?;
+        let metadata = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(
+            "SELECT connection_id, key, secret, secret_enc FROM connection_secrets WHERE substr(connection_id, 1, length(?1)) = ?1 COLLATE BINARY ORDER BY connection_id COLLATE BINARY, key COLLATE BINARY"
+        ).map_err(|e| e.to_string())?;
+        let secrets = stmt
+            .query_map([TUNNEL_SECRET_NAMESPACE_PREFIX], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(TunnelProfileSaveSnapshot { profiles: Vec::new(), metadata, secrets })
+    }
+
+    fn hydrate_tunnel_profile_snapshot(&self, snapshot: &mut TunnelProfileSaveSnapshot) -> Result<(), String> {
+        let mut profiles = Vec::new();
+        for (_, json) in &snapshot.metadata {
+            let mut profile = match serde_json::from_str::<TransportLayerConfig>(json) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    warn!("Failed to deserialize tunnel profile: {}", error);
+                    continue;
+                }
+            };
+            let namespace = format!("{TUNNEL_SECRET_NAMESPACE_PREFIX}{}", profile.id());
+            let secret =
+                snapshot.secrets.iter().find(|(id, key, _, _)| id == &namespace && key == CONFIG_SECRET_BLOB_KEY);
+            if let Some((_, _, legacy, encrypted)) = secret {
+                let blob = if let Some(encrypted) = encrypted.as_ref().filter(|value| !value.is_empty()) {
+                    self.secret_codec(false)?.decrypt(&namespace, CONFIG_SECRET_BLOB_KEY, encrypted)?
+                } else {
+                    legacy.clone()
+                };
+                if !blob.is_empty() {
+                    let stored = serde_json::from_str(&blob).map_err(|e| e.to_string())?;
+                    merge_missing_tunnel_profile_secrets(&mut profile, &stored);
+                }
+            }
+            profiles.push(profile);
+        }
+        snapshot.profiles = profiles;
+        Ok(())
+    }
+
     pub async fn load_tunnel_profiles(&self) -> Result<Vec<TransportLayerConfig>, String> {
         let rows: Vec<String> = self
             .with_conn(|conn| {
@@ -4048,6 +5125,22 @@ impl Storage {
     }
 
     pub async fn save_tunnel_profiles(&self, profiles: &[TransportLayerConfig]) -> Result<(), String> {
+        self.save_tunnel_profiles_inner(profiles, None).await.map(|_| ())
+    }
+
+    pub async fn save_tunnel_profiles_if_unchanged(
+        &self,
+        expected: &TunnelProfileSaveSnapshot,
+        profiles: &[TransportLayerConfig],
+    ) -> Result<bool, String> {
+        self.save_tunnel_profiles_inner(profiles, Some(expected)).await
+    }
+
+    async fn save_tunnel_profiles_inner(
+        &self,
+        profiles: &[TransportLayerConfig],
+        expected: Option<&TunnelProfileSaveSnapshot>,
+    ) -> Result<bool, String> {
         for profile in profiles {
             if profile.id().trim().is_empty() {
                 return Err("Tunnel profile id must not be empty".to_string());
@@ -4063,12 +5156,26 @@ impl Storage {
         }
         let needs_key =
             sanitized_profiles.iter().zip(&secret_blobs).any(|(sanitized, (_, profile))| sanitized != profile);
-        let codec = self.secret_codec_for_write(needs_key).await?;
+        let codec = if expected.is_none() { Some(self.secret_codec_for_write(needs_key).await?) } else { None };
+        let expected = expected.cloned();
+        let storage = self.clone();
         self.with_conn(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+            if let Some(expected) = expected {
+                if !Self::tunnel_profile_raw_snapshot(&tx)?.same_inventory(&expected) {
+                    return Ok(false);
+                }
+            }
+            let codec = match codec {
+                Some(codec) => codec,
+                None => storage.secret_codec_for_write_in_conn(&tx, needs_key)?,
+            };
             tx.execute("DELETE FROM tunnel_profiles", []).map_err(|e| e.to_string())?;
-            tx.execute("DELETE FROM connection_secrets WHERE connection_id LIKE 'tunnel_profile.%'", [])
-                .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM connection_secrets WHERE substr(connection_id, 1, length(?1)) = ?1 COLLATE BINARY",
+                [TUNNEL_SECRET_NAMESPACE_PREFIX],
+            )
+            .map_err(|e| e.to_string())?;
             for profile in &sanitized_profiles {
                 let json = serde_json::to_string(profile).map_err(|e| e.to_string())?;
                 tx.execute(
@@ -4091,7 +5198,8 @@ impl Storage {
                     )?;
                 }
             }
-            tx.commit().map_err(|e| e.to_string())
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(true)
         })
         .await
     }
@@ -4272,12 +5380,14 @@ impl Storage {
             let dedicated_keys = [
                 APP_APPEARANCE_SETTINGS_KEY,
                 MCP_GLOBAL_POLICY_KEY,
+                MCP_ACCESS_POLICY_KEY,
                 WEB_MCP_SETTINGS_KEY,
                 MAX_RETRIES_KEY,
                 SQL_FILE_UPLOAD_MAX_MB_KEY,
                 HISTORY_RETENTION_LIMIT_KEY,
                 AI_PLUGIN_TOOL_PLUGINS_KEY,
                 PLUGIN_DATA_GRANTS_KEY,
+                PLUGIN_MCP_GRANTS_KEY,
                 MCP_HISTORY_RETENTION_LIMIT_KEY,
             ];
             for key in dedicated_keys {
@@ -4324,12 +5434,15 @@ impl Storage {
                         configured: false,
                         read_only: policy.read_only,
                         allow_dangerous_sql: policy.allow_dangerous_sql,
+                        prompt_high_risk_sql: policy.prompt_high_risk_sql,
+                        call_confirmation: policy.call_confirmation,
                         allowed_connection_ids: policy.allowed_connection_ids,
                         allowed_group_ids: policy.allowed_group_ids,
                         allowed_tool_names: policy.allowed_tool_names,
                         connection_policies: policy.connection_policies,
                         group_policies: policy.group_policies,
                         query_timeout_secs: policy.query_timeout_secs,
+                        plugin_tools_mode: policy.plugin_tools_mode,
                     });
                 };
                 let settings = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
@@ -4340,12 +5453,15 @@ impl Storage {
                         configured: false,
                         read_only: policy.read_only,
                         allow_dangerous_sql: policy.allow_dangerous_sql,
+                        prompt_high_risk_sql: policy.prompt_high_risk_sql,
+                        call_confirmation: policy.call_confirmation,
                         allowed_connection_ids: policy.allowed_connection_ids,
                         allowed_group_ids: policy.allowed_group_ids,
                         allowed_tool_names: policy.allowed_tool_names,
                         connection_policies: policy.connection_policies,
                         group_policies: policy.group_policies,
                         query_timeout_secs: policy.query_timeout_secs,
+                        plugin_tools_mode: policy.plugin_tools_mode,
                     });
                 };
                 let policy = serde_json::from_value::<McpGlobalPolicy>(value.clone())
@@ -4355,20 +5471,180 @@ impl Storage {
                     configured: true,
                     read_only: policy.read_only,
                     allow_dangerous_sql: policy.allow_dangerous_sql,
+                    prompt_high_risk_sql: policy.prompt_high_risk_sql,
+                    call_confirmation: policy.call_confirmation,
                     allowed_connection_ids: policy.allowed_connection_ids,
                     allowed_group_ids: policy.allowed_group_ids,
                     allowed_tool_names: policy.allowed_tool_names,
                     connection_policies: policy.connection_policies,
                     group_policies: policy.group_policies,
                     query_timeout_secs: policy.query_timeout_secs,
+                    plugin_tools_mode: policy.plugin_tools_mode,
                 })
             })
             .await;
         result.map_err(|e| format!("MCP_POLICY_UNAVAILABLE: {e}"))
     }
 
+    /// The policy every MCP host enforces, in v1 shape. A saved v2 policy is
+    /// authoritative and projected (never wider); otherwise the saved v1
+    /// policy is used as is. Hosts read this instead of the raw v1 key so a
+    /// v2 policy written by the settings UI takes effect immediately, while
+    /// the v1 key keeps serving older standalone `dbx-mcp` binaries.
+    pub async fn load_enforced_mcp_policy(&self) -> Result<McpGlobalPolicyState, String> {
+        let settings = self.load_app_settings_json().await.map_err(|e| format!("MCP_POLICY_UNAVAILABLE: {e}"))?;
+        let Some(access) = saved_mcp_access_policy(&settings).map_err(|e| format!("MCP_POLICY_UNAVAILABLE: {e}"))?
+        else {
+            return self.load_mcp_global_policy().await;
+        };
+        let policy = access.to_v1();
+        Ok(McpGlobalPolicyState {
+            configured: settings.contains_key(MCP_GLOBAL_POLICY_KEY),
+            read_only: policy.read_only,
+            allow_dangerous_sql: policy.allow_dangerous_sql,
+            prompt_high_risk_sql: policy.prompt_high_risk_sql,
+            call_confirmation: policy.call_confirmation,
+            allowed_connection_ids: policy.allowed_connection_ids,
+            allowed_group_ids: policy.allowed_group_ids,
+            allowed_tool_names: policy.allowed_tool_names,
+            connection_policies: policy.connection_policies,
+            group_policies: policy.group_policies,
+            query_timeout_secs: policy.query_timeout_secs,
+            plugin_tools_mode: access.plugin_tools_mode,
+        })
+    }
+
+    /// The v2 access policy: the saved v2 value when present, else the
+    /// lossless mapping of the saved v1 policy (or the default).
+    pub async fn load_mcp_access_policy(&self) -> Result<crate::mcp_access::McpAccessPolicy, String> {
+        let settings = self.load_app_settings_json().await.map_err(|e| format!("MCP_POLICY_UNAVAILABLE: {e}"))?;
+        if let Some(access) = saved_mcp_access_policy(&settings).map_err(|e| format!("MCP_POLICY_UNAVAILABLE: {e}"))? {
+            return Ok(access);
+        }
+        Ok(crate::mcp_access::McpAccessPolicy::from_v1(&self.load_mcp_global_policy().await?.policy()))
+    }
+
+    /// Explicit recovery only: preserve corrupt data and reset access to deny
+    /// all. Ordinary saves and runtime reads must continue to fail closed.
+    pub async fn reset_invalid_mcp_access_policy(&self) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let mut settings = app_settings_map_from_conn(conn)?;
+            if saved_mcp_access_policy(&settings).is_ok() {
+                return Err("MCP policy is valid; recovery is not required".to_string());
+            }
+            let backup_key = format!("mcp_policy_recovery_backup_{}", Uuid::new_v4());
+            settings.insert(
+                backup_key,
+                serde_json::json!({
+                    "v1": settings.get(MCP_GLOBAL_POLICY_KEY),
+                    "v2": settings.get(MCP_ACCESS_POLICY_KEY),
+                }),
+            );
+            let access = crate::mcp_access::McpAccessPolicy {
+                default_access: crate::mcp_access::McpAccessLevel::Read,
+                visibility: crate::mcp_access::McpVisibilityMode::Selected,
+                allowed_tool_names: Some(Vec::new()),
+                ..Default::default()
+            };
+            settings.insert(
+                MCP_GLOBAL_POLICY_KEY.to_string(),
+                serde_json::to_value(access.to_v1()).map_err(|e| e.to_string())?,
+            );
+            settings
+                .insert(MCP_ACCESS_POLICY_KEY.to_string(), serde_json::to_value(access).map_err(|e| e.to_string())?);
+            write_app_settings_map(conn, &settings)
+        })
+        .await
+        .map_err(|e| format!("MCP_POLICY_UNAVAILABLE: {e}"))
+    }
+
+    /// Saves a v2 policy together with its never-wider v1 projection in one
+    /// write, so v1-only readers can never see a wider policy than v2.
+    pub async fn save_mcp_access_policy(&self, policy: &crate::mcp_access::McpAccessPolicy) -> Result<(), String> {
+        let access = serde_json::to_value(policy).map_err(|e| format!("MCP_POLICY_UNAVAILABLE: {e}"))?;
+        let projected = serde_json::to_value(policy.to_v1()).map_err(|e| format!("MCP_POLICY_UNAVAILABLE: {e}"))?;
+        self.with_conn(move |conn| {
+            let mut settings = app_settings_map_from_conn(conn)?;
+            settings.insert(MCP_ACCESS_POLICY_KEY.to_string(), access);
+            settings.insert(MCP_GLOBAL_POLICY_KEY.to_string(), projected);
+            write_app_settings_map(conn, &settings)
+        })
+        .await
+        .map_err(|e| format!("MCP_POLICY_UNAVAILABLE: {e}"))
+    }
+
+    /// Sets one plugin sub-scope rule (`kind` other than `database`) and the
+    /// connection's admission mode for that kind, in one write. Passing
+    /// `rule: None` removes the rule. Used by the access-control tree, which
+    /// otherwise edits the v1 draft; database rules stay on the v1 path.
+    pub async fn set_mcp_plugin_scope_rule(
+        &self,
+        connection_id: &str,
+        kind: &str,
+        value: Option<&str>,
+        rule: Option<crate::mcp_access::McpAccessRule>,
+        sub_scope: Option<crate::mcp_access::McpSubScopeMode>,
+    ) -> Result<crate::mcp_access::McpAccessPolicy, String> {
+        if kind.trim().is_empty() || kind.trim() == "database" {
+            return Err("A plugin scope kind other than `database` is required".to_string());
+        }
+        let connection_id = normalized_setting_id(connection_id, "connection id")?;
+        let kind = kind.trim().to_string();
+        let value = value.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string);
+        self.with_conn(move |conn| {
+            // Read, merge and write under the same storage lock: edits on two
+            // connection rows must not overwrite one another's saved rules.
+            let mut settings = app_settings_map_from_conn(conn)?;
+            let mut access = if let Some(access) = saved_mcp_access_policy(&settings)? {
+                access
+            } else {
+                let policy = settings
+                    .get(MCP_GLOBAL_POLICY_KEY)
+                    .map(|value| serde_json::from_value::<McpGlobalPolicy>(value.clone()))
+                    .transpose()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or_default();
+                crate::mcp_access::McpAccessPolicy::from_v1(&policy)
+            };
+            if let Some(value) = value {
+                let target = crate::mcp_access::McpRuleTarget::Scope {
+                    connection_id: connection_id.clone(),
+                    scope: kind.clone(),
+                    value,
+                };
+                match rule {
+                    Some(rule) => {
+                        access.rules.insert(target, rule);
+                    }
+                    None => {
+                        access.rules.remove(&target);
+                    }
+                }
+            }
+            let connection =
+                access.rules.entry(crate::mcp_access::McpRuleTarget::Connection { id: connection_id }).or_default();
+            connection.sub_scope_kind = Some(kind);
+            if let Some(mode) = sub_scope {
+                connection.sub_scope = Some(mode);
+            }
+            settings
+                .insert(MCP_ACCESS_POLICY_KEY.to_string(), serde_json::to_value(&access).map_err(|e| e.to_string())?);
+            settings.insert(
+                MCP_GLOBAL_POLICY_KEY.to_string(),
+                serde_json::to_value(access.to_v1()).map_err(|e| e.to_string())?,
+            );
+            write_app_settings_map(conn, &settings)?;
+            Ok(access)
+        })
+        .await
+        .map_err(|e| format!("MCP_POLICY_UNAVAILABLE: {e}"))
+    }
+
+    /// Saves the v1 settings draft while preserving v2-only restrictions.
+    /// The merged policy also supplies the conservative v1 compatibility view.
     pub async fn save_mcp_global_policy(&self, policy: &McpGlobalPolicy) -> Result<(), String> {
-        let policy = serde_json::to_value(policy.normalized()).map_err(|e| format!("MCP_POLICY_UNAVAILABLE: {e}"))?;
+        let rebuilt = crate::mcp_access::McpAccessPolicy::from_v1(policy);
+        let draft = policy.normalized();
         self.with_conn(move |conn| {
             let current: Option<String> = conn
                 .query_row("SELECT settings_json FROM app_settings WHERE id = 1", [], |row| row.get(0))
@@ -4379,7 +5655,19 @@ impl Storage {
                     .map_err(|e| format!("invalid app settings JSON: {e}"))?,
                 None => serde_json::Map::new(),
             };
+            // Keep rules only v2 can express (plugin sub-scopes) across v1 saves.
+            let previous = saved_mcp_access_policy(&settings)?;
+            let access = match previous {
+                Some(previous) => rebuilt.clone().with_v2_only_rules_from(&previous),
+                None => rebuilt.clone(),
+            };
+            // Preserve the v1 representation for ordinary v1 edits. Only a
+            // merge of v2-only rules needs a lossy compatibility projection.
+            let policy = if access == rebuilt { draft } else { access.to_v1() };
+            let policy = serde_json::to_value(policy).map_err(|e| e.to_string())?;
+            let access = serde_json::to_value(access).map_err(|e| e.to_string())?;
             settings.insert(MCP_GLOBAL_POLICY_KEY.to_string(), policy);
+            settings.insert(MCP_ACCESS_POLICY_KEY.to_string(), access);
             let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
             conn.execute("INSERT OR REPLACE INTO app_settings (id, settings_json) VALUES (1, ?1)", [json])
                 .map(|_| ())
@@ -4488,6 +5776,36 @@ impl Storage {
         .await
     }
 
+    /// Every saved external MCP grant, keyed by plugin id. Malformed entries
+    /// are skipped so one broken record never hides the others.
+    pub async fn load_plugin_mcp_grants(&self) -> Result<HashMap<String, PluginMcpGrant>, String> {
+        let settings = self.load_app_settings_json().await?;
+        Ok(plugin_mcp_grants_from(settings.get(PLUGIN_MCP_GRANTS_KEY)))
+    }
+
+    /// Replaces one plugin's external MCP grant (read-modify-write inside one
+    /// connection closure) and returns the stored value.
+    pub async fn save_plugin_mcp_grant(
+        &self,
+        plugin_id: &str,
+        grant: PluginMcpGrant,
+    ) -> Result<PluginMcpGrant, String> {
+        let plugin_id = normalized_setting_id(plugin_id, "plugin id")?;
+        let grant = grant.normalized();
+        self.with_conn(move |conn| {
+            let mut settings = app_settings_map_from_conn(conn)?;
+            let mut grants = match settings.remove(PLUGIN_MCP_GRANTS_KEY) {
+                Some(serde_json::Value::Object(grants)) => grants,
+                _ => serde_json::Map::new(),
+            };
+            grants.insert(plugin_id, serde_json::to_value(&grant).map_err(|error| error.to_string())?);
+            settings.insert(PLUGIN_MCP_GRANTS_KEY.to_string(), serde_json::Value::Object(grants));
+            write_app_settings_map(conn, &settings)?;
+            Ok(grant)
+        })
+        .await
+    }
+
     /// Drops everything the user granted to a plugin (AI tool access and data
     /// grants). Called after uninstall so a reinstall starts without consent.
     pub async fn forget_plugin_permissions(&self, plugin_id: &str) -> Result<(), String> {
@@ -4501,6 +5819,9 @@ impl Storage {
             disabled.retain(|candidate| candidate != &plugin_id);
             settings.insert(AI_PLUGIN_TOOL_DISABLED_PLUGINS_KEY.to_string(), serde_json::json!(disabled));
             if let Some(serde_json::Value::Object(grants)) = settings.get_mut(PLUGIN_DATA_GRANTS_KEY) {
+                grants.remove(&plugin_id);
+            }
+            if let Some(serde_json::Value::Object(grants)) = settings.get_mut(PLUGIN_MCP_GRANTS_KEY) {
                 grants.remove(&plugin_id);
             }
             write_app_settings_map(conn, &settings)
@@ -4583,6 +5904,10 @@ impl Storage {
 
     pub async fn save_desktop_settings(&self, desktop_settings: &DesktopSettings) -> Result<(), String> {
         let mut settings = self.load_app_settings_json().await?;
+        settings.insert(
+            "linux_floating_frame_enabled".to_string(),
+            serde_json::Value::Bool(desktop_settings.linux_floating_frame_enabled),
+        );
         settings.remove("run_in_background");
         settings.insert("show_tray_icon".to_string(), serde_json::Value::Bool(desktop_settings.show_tray_icon));
         settings.insert(
@@ -4659,6 +5984,10 @@ impl Storage {
             }
         }
         settings.insert(
+            "custom_ai_skill_auto_enabled".to_string(),
+            serde_json::Value::Bool(desktop_settings.custom_ai_skill_auto_enabled),
+        );
+        settings.insert(
             "sidebar_table_page_size".to_string(),
             serde_json::Value::Number(serde_json::Number::from(desktop_settings.sidebar_table_page_size)),
         );
@@ -4668,6 +5997,10 @@ impl Storage {
     pub async fn load_desktop_settings(&self) -> Result<DesktopSettings, String> {
         let settings = self.load_app_settings_json().await?;
         Ok(DesktopSettings {
+            linux_floating_frame_enabled: settings
+                .get("linux_floating_frame_enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
             show_tray_icon: settings
                 .get("show_tray_icon")
                 .and_then(|value| value.as_bool())
@@ -4736,6 +6069,10 @@ impl Storage {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string),
+            custom_ai_skill_auto_enabled: settings
+                .get("custom_ai_skill_auto_enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or_else(|| DesktopSettings::default().custom_ai_skill_auto_enabled),
             sidebar_table_page_size: settings
                 .get("sidebar_table_page_size")
                 .and_then(|value| value.as_u64())
@@ -5336,8 +6673,8 @@ impl Storage {
             let tx = conn.transaction().map_err(|e| e.to_string())?;
             tx.execute(
                 "INSERT INTO ai_conversations \
-                 (id, title, connection_name, connection_id, database, schema_name, messages_json, queued_input, created_at, updated_at, plugin_context_json) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 (id, title, connection_name, connection_id, database, schema_name, messages_json, queued_input, created_at, updated_at, plugin_context_json, assistant_mode, assistant_action) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                    title = excluded.title, \
                    connection_name = excluded.connection_name, \
@@ -5347,7 +6684,8 @@ impl Storage {
                    messages_json = excluded.messages_json, \
                    queued_input = excluded.queued_input, \
                    created_at = excluded.created_at, \
-                   updated_at = excluded.updated_at, plugin_context_json = excluded.plugin_context_json",
+                   updated_at = excluded.updated_at, plugin_context_json = excluded.plugin_context_json, \
+                   assistant_mode = excluded.assistant_mode, assistant_action = excluded.assistant_action",
                 params![
                     conv.id,
                     conv.title,
@@ -5359,7 +6697,9 @@ impl Storage {
                     conv.queued_input,
                     conv.created_at,
                     conv.updated_at,
-                    conv.plugin_context.map(|value| value.to_string())
+                    conv.plugin_context.map(|value| value.to_string()),
+                    conv.assistant_mode,
+                    conv.assistant_action
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -5374,7 +6714,7 @@ impl Storage {
         self.with_conn(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, title, connection_name, database, messages_json, queued_input, created_at, updated_at, plugin_context_json, connection_id, schema_name \
+                    "SELECT id, title, connection_name, database, messages_json, queued_input, created_at, updated_at, plugin_context_json, connection_id, schema_name, assistant_mode, assistant_action \
                      FROM ai_conversations ORDER BY updated_at DESC",
                 )
                 .map_err(|e| e.to_string())?;
@@ -5395,6 +6735,8 @@ impl Storage {
                         plugin_context: row.get::<_, Option<String>>(8)?.map(|json| serde_json::from_str(&json)).transpose().map_err(map_from_sql_err)?,
                         connection_id: row.get(9)?,
                         schema: row.get(10)?,
+                        assistant_mode: row.get(11)?,
+                        assistant_action: row.get(12)?,
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -5461,8 +6803,8 @@ impl Storage {
             let tx = conn.transaction().map_err(|e| e.to_string())?;
             tx.execute(
                 "INSERT INTO ai_conversations
-                 (id, title, connection_name, connection_id, database, schema_name, messages_json, queued_input, created_at, updated_at, plugin_context_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 (id, title, connection_name, connection_id, database, schema_name, messages_json, queued_input, created_at, updated_at, plugin_context_json, assistant_mode, assistant_action)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(id) DO UPDATE SET
                    title = excluded.title,
                    connection_name = excluded.connection_name,
@@ -5472,7 +6814,8 @@ impl Storage {
                    messages_json = excluded.messages_json,
                    queued_input = excluded.queued_input,
                    created_at = excluded.created_at,
-                   updated_at = excluded.updated_at, plugin_context_json = excluded.plugin_context_json",
+                   updated_at = excluded.updated_at, plugin_context_json = excluded.plugin_context_json,
+                   assistant_mode = excluded.assistant_mode, assistant_action = excluded.assistant_action",
                 params![
                     conv.id,
                     conv.title,
@@ -5484,7 +6827,9 @@ impl Storage {
                     conv.queued_input,
                     conv.created_at,
                     conv.updated_at,
-                    conv.plugin_context.map(|value| value.to_string())
+                    conv.plugin_context.map(|value| value.to_string()),
+                    conv.assistant_mode,
+                    conv.assistant_action
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -5750,8 +7095,10 @@ fn ensure_mcp_connection_change_allowed_in_tx(
     Ok(())
 }
 
-fn sanitized_connection_config(config: &ConnectionConfig) -> ConnectionConfig {
+/// Connection metadata with every field managed by the secret store removed.
+pub fn sanitized_connection_config(config: &ConnectionConfig) -> ConnectionConfig {
     let mut sanitized = config.clone().canonicalized();
+    normalize_rocketmq_credentials(&mut sanitized);
     sanitized.password = String::new();
     sanitized.url_params = None;
     scrub_transport_layer_secrets(&mut sanitized);
@@ -5773,7 +7120,8 @@ fn persist_connection_in_tx(
     codec: &SecretCodec,
     config: &ConnectionConfig,
 ) -> Result<(), String> {
-    let config = config.clone().canonicalized();
+    let mut config = config.clone().canonicalized();
+    normalize_rocketmq_credentials(&mut config);
     let config_id = config.id.clone();
     let sanitized = sanitized_connection_config(&config);
     let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
@@ -6147,20 +7495,13 @@ impl Storage {
                     persist_secret_in_tx(&tx, &codec, &config.id, "password", "")?;
                     delete_secret_prefix_in_tx(&tx, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
                 }
-                let mut sanitized = config;
-                sanitized.password = String::new();
-                sanitized.url_params = None;
-                scrub_transport_layer_secrets(&mut sanitized);
-                sanitized.redis_sentinel_password = String::new();
-                sanitized.connection_string = None;
-                sanitized.init_script = None;
-                scrub_mq_auth_secrets(&mut sanitized);
-                scrub_mqtt_auth_secrets(&mut sanitized);
-                scrub_mq_token_signing_secret(&mut sanitized);
-                scrub_nacos_auth_secrets(&mut sanitized);
-                scrub_cassandra_tls_secrets(&mut sanitized);
-                scrub_salesforce_auth_secrets(&mut sanitized);
-                sanitized.connection_secrets.clear();
+                if is_rocketmq_connection(&config)
+                    && (!config.save_password
+                        || mq_auth_object(config.external_config.as_ref()).and_then(mq_auth_kind) == Some("none"))
+                {
+                    delete_secret_prefix_in_tx(&tx, &config.id, MQ_AUTH_SECRET_PREFIX)?;
+                }
+                let sanitized = sanitized_connection_config(&config);
                 let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
 
                 tx.execute("INSERT INTO connections (id, config_json) VALUES (?1, ?2)", params![config_id, json])
@@ -6215,6 +7556,8 @@ impl Storage {
                 tx.execute("DELETE FROM connections WHERE id = ?1", [id]).map_err(|e| e.to_string())?;
                 tx.execute("DELETE FROM connection_secrets WHERE connection_id = ?1", [id])
                     .map_err(|e| e.to_string())?;
+                let mqtt_history_key = format!("{MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX}{id}");
+                tx.execute("DELETE FROM state_store WHERE key = ?1", [mqtt_history_key]).map_err(|e| e.to_string())?;
             }
             tx.commit().map_err(|e| e.to_string())
         })
@@ -6271,6 +7614,11 @@ impl Storage {
             let mut copy: ConnectionConfig = serde_json::from_str(&source_json).map_err(|error| error.to_string())?;
             copy.id = copy_id.clone();
             copy.name = copy_name;
+            for layer in &mut copy.transport_layers {
+                if let TransportLayerConfig::Ssh(ssh) = layer {
+                    ssh.local_port = None;
+                }
+            }
             let copy_json = serde_json::to_string(&copy).map_err(|error| error.to_string())?;
             tx.execute("INSERT INTO connections (id, config_json) VALUES (?1, ?2)", params![copy_id, copy_json])
                 .map_err(|error| error.to_string())?;
@@ -6323,6 +7671,8 @@ impl Storage {
             if removed {
                 tx.execute("DELETE FROM connection_secrets WHERE connection_id = ?1", [&connection_id])
                     .map_err(|e| e.to_string())?;
+                let mqtt_history_key = format!("{MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX}{connection_id}");
+                tx.execute("DELETE FROM state_store WHERE key = ?1", [mqtt_history_key]).map_err(|e| e.to_string())?;
             }
             tx.commit().map_err(|e| e.to_string())?;
             Ok(removed)
@@ -6429,6 +7779,166 @@ impl Storage {
         .await
     }
 
+    /// Append one successfully published message to a connection's bounded
+    /// local history. The read-modify-write runs in one SQLite transaction so
+    /// concurrent publishes do not overwrite each other's records.
+    #[cfg(feature = "mq-admin")]
+    pub async fn append_mqtt_sent_message(&self, connection_id: &str, message: &MqttMessage) -> Result<(), String> {
+        if message.direction != MqttMessageDirection::Sent {
+            return Err("MQTT sent history accepts outgoing messages only".to_string());
+        }
+        self.append_mqtt_history_messages(connection_id, std::slice::from_ref(message), false).await
+    }
+
+    /// Reconcile live MQTT messages with persisted history without re-adding
+    /// entries already stored by an earlier publish or console poll.
+    #[cfg(feature = "mq-admin")]
+    pub async fn reconcile_mqtt_message_history(
+        &self,
+        connection_id: &str,
+        messages: &[MqttMessage],
+    ) -> Result<(), String> {
+        self.append_mqtt_history_messages(connection_id, messages, true).await
+    }
+
+    #[cfg(feature = "mq-admin")]
+    async fn append_mqtt_history_messages(
+        &self,
+        connection_id: &str,
+        incoming_messages: &[MqttMessage],
+        skip_existing: bool,
+    ) -> Result<(), String> {
+        if incoming_messages.is_empty() {
+            return Ok(());
+        }
+        let key = format!("{MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX}{connection_id}");
+        let incoming_messages = incoming_messages.to_vec();
+        self.with_conn(move |conn| {
+            let tx =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+            let current: Option<Vec<u8>> = tx
+                .query_row("SELECT value FROM state_store WHERE key = ?1", [&key], |row| row.get(0))
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let mut stored_messages: Vec<MqttMessage> = current
+                .map(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+                .transpose()?
+                .unwrap_or_default();
+            let mut message_counts = HashMap::<(String, String, Option<String>, u8, bool, bool, u64), usize>::new();
+            for message in &stored_messages {
+                *message_counts.entry(mqtt_history_message_identity(message)).or_default() += 1;
+            }
+            let mut changed = false;
+            for message in incoming_messages {
+                let identity = mqtt_history_message_identity(&message);
+                if skip_existing {
+                    if let Some(count) = message_counts.get_mut(&identity) {
+                        if *count > 0 {
+                            *count -= 1;
+                            continue;
+                        }
+                    }
+                    *message_counts.entry(identity).or_default() += 1;
+                }
+                stored_messages.push(message);
+                changed = true;
+            }
+            if !changed {
+                tx.commit().map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            stored_messages.sort_by_key(|entry| entry.received_at_ms);
+            if stored_messages.len() > MQTT_MESSAGE_HISTORY_MAX_MESSAGES {
+                stored_messages.drain(..stored_messages.len() - MQTT_MESSAGE_HISTORY_MAX_MESSAGES);
+            }
+
+            let bytes = loop {
+                let bytes = serde_json::to_vec(&stored_messages).map_err(|error| error.to_string())?;
+                if bytes.len() <= MQTT_MESSAGE_HISTORY_MAX_BYTES {
+                    break bytes;
+                }
+                if stored_messages.len() <= 1 {
+                    // Keep the previous history if one message alone is too large.
+                    tx.commit().map_err(|error| error.to_string())?;
+                    return Ok(());
+                }
+                stored_messages.remove(0);
+            };
+            tx.execute(
+                "INSERT INTO state_store (key, value, content_type, version, payload) \
+                 VALUES (?1, ?2, 'application/json', 1, x'') \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, content_type = excluded.content_type, \
+                 version = version + 1, payload = excluded.payload",
+                params![key, bytes],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Load the bounded MQTT message history for one connection.
+    #[cfg(feature = "mq-admin")]
+    pub async fn load_mqtt_message_history(&self, connection_id: &str) -> Result<Vec<MqttMessage>, String> {
+        let key = format!("{MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX}{connection_id}");
+        let Some((bytes, _)) = self.load_state(&key).await? else {
+            return Ok(Vec::new());
+        };
+        let mut messages: Vec<MqttMessage> = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if messages.len() > MQTT_MESSAGE_HISTORY_MAX_MESSAGES {
+            messages.drain(..messages.len() - MQTT_MESSAGE_HISTORY_MAX_MESSAGES);
+        }
+        Ok(messages)
+    }
+
+    /// Remove MQTT message history when the user clears the console messages.
+    #[cfg(feature = "mq-admin")]
+    pub async fn clear_mqtt_message_history(&self, connection_id: &str) -> Result<(), String> {
+        let key = format!("{MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX}{connection_id}");
+        self.delete_state(&key).await
+    }
+
+    /// Remove one exact message from a connection's persisted MQTT history.
+    #[cfg(feature = "mq-admin")]
+    pub async fn delete_mqtt_message_history_entry(
+        &self,
+        connection_id: &str,
+        message: &MqttMessage,
+    ) -> Result<(), String> {
+        let key = format!("{MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX}{connection_id}");
+        let message_identity = mqtt_history_message_identity(message);
+        self.with_conn(move |conn| {
+            let tx =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+            let current: Option<Vec<u8>> = tx
+                .query_row("SELECT value FROM state_store WHERE key = ?1", [&key], |row| row.get(0))
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some(bytes) = current else {
+                tx.commit().map_err(|error| error.to_string())?;
+                return Ok(());
+            };
+            let mut messages: Vec<MqttMessage> = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            if let Some(index) =
+                messages.iter().position(|candidate| mqtt_history_message_identity(candidate) == message_identity)
+            {
+                messages.remove(index);
+                if messages.is_empty() {
+                    tx.execute("DELETE FROM state_store WHERE key = ?1", [&key]).map_err(|error| error.to_string())?;
+                } else {
+                    let value = serde_json::to_vec(&messages).map_err(|error| error.to_string())?;
+                    tx.execute(
+                        "UPDATE state_store SET value = ?1, version = version + 1 WHERE key = ?2",
+                        params![value, key],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+            tx.commit().map_err(|error| error.to_string())
+        })
+        .await
+    }
+
     /// Update only the persisted driver identity for an existing connection.
     /// This is used after runtime driver fallback and deliberately leaves all
     /// other connection metadata and separately stored secrets untouched.
@@ -6514,6 +8024,51 @@ impl Storage {
         .await
     }
 
+    pub async fn migrate_sidebar_user_admin_visibility(&self, legacy_show_user_admin: bool) -> Result<(), String> {
+        self.with_conn(move |conn| {
+            let tx =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+            let migrated: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM app_state WHERE key = 'sidebar_user_admin_visibility_migration_v1')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if migrated {
+                return Ok(());
+            }
+            if !legacy_show_user_admin {
+                let rows = {
+                    let mut stmt =
+                        tx.prepare("SELECT id, config_json FROM connections").map_err(|error| error.to_string())?;
+                    let rows = stmt
+                        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                        .map_err(|error| error.to_string())?;
+                    rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?
+                };
+                for (id, json) in rows {
+                    let Ok(serde_json::Value::Object(mut config)) = serde_json::from_str(&json) else {
+                        continue;
+                    };
+                    config.insert("show_user_admin".into(), serde_json::Value::Bool(false));
+                    tx.execute(
+                        "UPDATE connections SET config_json = ?1 WHERE id = ?2",
+                        params![serde_json::to_string(&config).map_err(|error| error.to_string())?, id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+            tx.execute(
+                "INSERT INTO app_state (key, value_json) VALUES ('sidebar_user_admin_visibility_migration_v1', 'true')",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())
+        })
+        .await
+    }
+
     pub async fn load_connections(&self) -> Result<Vec<ConnectionConfig>, String> {
         let rows: Vec<(String, String)> = self
             .with_conn(|conn| {
@@ -6594,6 +8149,7 @@ impl Storage {
             if !stored_plugin_secrets.is_empty() {
                 config.connection_secrets = stored_plugin_secrets;
             }
+            let needs_rocketmq_rewrite = normalize_rocketmq_credentials(&mut config);
             let needs_mq_auth_rewrite = self.hydrate_mq_auth_secrets(&id, &mut config).await?;
             let needs_mqtt_auth_rewrite = self.hydrate_mqtt_auth_secret(&id, &mut config).await?;
             let needs_mq_token_signing_rewrite = self.hydrate_mq_token_signing_secret(&id, &mut config).await?;
@@ -6614,7 +8170,8 @@ impl Storage {
                     needs_plugin_secret_rewrite = true;
                 }
             }
-            let needs_external_secret_rewrite = needs_mq_auth_rewrite
+            let needs_external_secret_rewrite = needs_rocketmq_rewrite
+                || needs_mq_auth_rewrite
                 || needs_mqtt_auth_rewrite
                 || needs_mq_token_signing_rewrite
                 || needs_nacos_auth_rewrite
@@ -6649,6 +8206,24 @@ impl Storage {
         connection_id: &str,
         config: &mut ConnectionConfig,
     ) -> Result<bool, String> {
+        if is_rocketmq_connection(config) && !config.save_password {
+            let had_inline = mq_auth_object(config.external_config.as_ref())
+                .and_then(|auth| auth.get("password"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|password| !password.is_empty());
+            scrub_mq_auth_secrets(config);
+            let connection_id = connection_id.to_string();
+            self.with_conn(move |conn| {
+                conn.execute(
+                    "DELETE FROM connection_secrets WHERE connection_id = ?1 AND key LIKE ?2",
+                    params![connection_id, format!("{MQ_AUTH_SECRET_PREFIX}%")],
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            })
+            .await?;
+            return Ok(had_inline);
+        }
         if config.db_type != DatabaseType::MessageQueue {
             return Ok(false);
         }
@@ -6831,8 +8406,8 @@ impl Storage {
             for file in &library.files {
                 tx.execute(
                     "INSERT INTO saved_sql_files \
-                     (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         file.id,
                         file.connection_id,
@@ -6846,7 +8421,8 @@ impl Storage {
                         file.open_count,
                         file.opened_at,
                         file.created_at,
-                        file.updated_at
+                        file.updated_at,
+                        file.is_default_query
                     ],
                 )
                 .map_err(|e| e.to_string())?;
@@ -6883,7 +8459,7 @@ impl Storage {
 
             let mut file_stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at \
+                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query \
                      FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
                 )
                 .map_err(|e| e.to_string())?;
@@ -6904,6 +8480,7 @@ impl Storage {
                         opened_at: row.get(10)?,
                         created_at: row.get(11)?,
                         updated_at: row.get(12)?,
+                        is_default_query: row.get(13)?,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -6919,7 +8496,7 @@ impl Storage {
         self.with_conn(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at \
+                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query \
                      FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
                 )
                 .map_err(|e| e.to_string())?;
@@ -6940,6 +8517,7 @@ impl Storage {
                         opened_at: row.get(10)?,
                         created_at: row.get(11)?,
                         updated_at: row.get(12)?,
+                        is_default_query: row.get(13)?,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -6976,7 +8554,7 @@ impl Storage {
 
             let mut file_stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, order_index, open_count, opened_at, created_at, updated_at \
+                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, order_index, open_count, opened_at, created_at, updated_at, is_default_query \
                      FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
                 )
                 .map_err(|e| e.to_string())?;
@@ -6997,6 +8575,7 @@ impl Storage {
                         opened_at: row.get(9)?,
                         created_at: row.get(10)?,
                         updated_at: row.get(11)?,
+                        is_default_query: row.get(12)?,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -7013,7 +8592,7 @@ impl Storage {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at \
+                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query \
                      FROM saved_sql_files WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
@@ -7033,6 +8612,7 @@ impl Storage {
                     opened_at: row.get(10)?,
                     created_at: row.get(11)?,
                     updated_at: row.get(12)?,
+                    is_default_query: row.get(13)?,
                 })
             }) {
                 Ok(file) => Ok(Some(file)),
@@ -7106,8 +8686,8 @@ impl Storage {
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO saved_sql_files \
-                 (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                  connection_id = excluded.connection_id, \
                  folder_id = excluded.folder_id, \
@@ -7115,11 +8695,12 @@ impl Storage {
                  database_name = excluded.database_name, \
                  catalog_name = excluded.catalog_name, \
                  schema_name = excluded.schema_name, \
-                 sql_text = CASE WHEN ?14 THEN excluded.sql_text ELSE saved_sql_files.sql_text END, \
+                 sql_text = CASE WHEN ?15 THEN excluded.sql_text ELSE saved_sql_files.sql_text END, \
                  order_index = excluded.order_index, \
                  open_count = excluded.open_count, \
                  opened_at = excluded.opened_at, \
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at, \
+                 is_default_query = excluded.is_default_query",
                 params![
                     file.id,
                     file.connection_id,
@@ -7134,11 +8715,31 @@ impl Storage {
                     file.opened_at,
                     file.created_at,
                     file.updated_at,
+                    file.is_default_query,
                     file.sql_loaded
                 ],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    /// Autosave only the document body: concurrent metadata writes must not be
+    /// overwritten, and a deleted default query must never be recreated here.
+    pub async fn save_default_query_content(&self, id: &str, sql: &str, updated_at: &str) -> Result<(), String> {
+        let (id, sql, updated_at) = (id.to_string(), sql.to_string(), updated_at.to_string());
+        self.with_conn(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE saved_sql_files SET sql_text = ?2, updated_at = ?3 WHERE id = ?1 AND is_default_query = 1",
+                    params![id, sql, updated_at],
+                )
+                .map_err(|e| e.to_string())?;
+            if changed == 0 {
+                return Err("Default query no longer exists".to_string());
+            }
+            Ok(())
         })
         .await
     }
@@ -8099,6 +9700,12 @@ fn apply_sync_connections_in_tx(
     };
     for config in configs {
         let config = config.canonicalized();
+        if is_rocketmq_connection(&config)
+            && (!config.save_password
+                || mq_auth_object(config.external_config.as_ref()).and_then(mq_auth_kind) == Some("none"))
+        {
+            delete_secret_prefix_in_tx(tx, &config.id, MQ_AUTH_SECRET_PREFIX)?;
+        }
         if !config.save_password && !merge_existing {
             persist_secret_in_tx(tx, codec, &config.id, "password", "")?;
             delete_secret_prefix_in_tx(tx, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
@@ -8224,8 +9831,12 @@ fn apply_sync_tunnel_profiles_in_tx(
         let mut sanitized = profile.clone();
         sanitized.scrub_secrets();
         let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
-        tx.execute("INSERT INTO tunnel_profiles (id, config_json) VALUES (?1, ?2)", params![profile.id(), json])
-            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO tunnel_profiles (id, config_json) VALUES (?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json",
+            params![profile.id(), json],
+        )
+        .map_err(|e| e.to_string())?;
         if sanitized != profile {
             persist_secret_in_tx(
                 tx,
@@ -8392,6 +10003,10 @@ fn apply_desktop_settings_in_tx(
     selected_keys: Option<&[String]>,
 ) -> Result<(), String> {
     let mut values = serde_json::Map::new();
+    values.insert(
+        "linux_floating_frame_enabled".to_string(),
+        serde_json::Value::Bool(settings.linux_floating_frame_enabled),
+    );
     values.insert("show_tray_icon".to_string(), serde_json::Value::Bool(settings.show_tray_icon));
     values.insert("icon_theme".to_string(), serde_json::to_value(settings.icon_theme).map_err(|e| e.to_string())?);
     values.insert("quit_on_close".to_string(), serde_json::Value::Bool(settings.quit_on_close));
@@ -8481,8 +10096,8 @@ fn apply_saved_sql_in_tx(tx: &Transaction<'_>, library: &SavedSqlLibrary, merge_
     }
     for file in &library.files {
         tx.execute(
-            "INSERT OR REPLACE INTO saved_sql_files (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![file.id, file.connection_id, file.folder_id, file.name, file.database, file.catalog, file.schema, file.sql, file.order_index, file.open_count, file.opened_at, file.created_at, file.updated_at],
+            "INSERT INTO saved_sql_files (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET connection_id=excluded.connection_id, folder_id=excluded.folder_id, name=excluded.name, database_name=excluded.database_name, catalog_name=excluded.catalog_name, schema_name=excluded.schema_name, sql_text=excluded.sql_text, order_index=excluded.order_index, open_count=excluded.open_count, opened_at=excluded.opened_at, created_at=excluded.created_at, updated_at=excluded.updated_at, is_default_query=excluded.is_default_query",
+            params![file.id, file.connection_id, file.folder_id, file.name, file.database, file.catalog, file.schema, file.sql, file.order_index, file.open_count, file.opened_at, file.created_at, file.updated_at, file.is_default_query],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -8494,6 +10109,9 @@ fn persist_mq_auth_secrets_in_tx(
     codec: &SecretCodec,
     config: &ConnectionConfig,
 ) -> Result<(), String> {
+    if is_rocketmq_connection(config) && !config.save_password {
+        return delete_secret_prefix_in_tx(tx, &config.id, MQ_AUTH_SECRET_PREFIX);
+    }
     if config.db_type != DatabaseType::MessageQueue {
         delete_secret_prefix_in_tx(tx, &config.id, MQ_AUTH_SECRET_PREFIX)?;
         return Ok(());
@@ -8868,9 +10486,13 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::{
+        app_settings_map_from_conn, plugin_mcp_grants_from, write_app_settings_map, PluginMcpAccessLevel,
+        PluginMcpGrant,
+    };
+    use super::{
         maybe_import_user_data_db, AppAppearanceSettingsPatch, DataDbImportResult, DesktopIconTheme, DesktopSettings,
         McpGlobalPolicy, McpGlobalPolicyState, Storage, SyncImportPlan, KEEP_TERMINAL_AI_RUNS_PER_CONVERSATION,
-        MCP_GLOBAL_POLICY_KEY,
+        MCP_ACCESS_POLICY_KEY, MCP_GLOBAL_POLICY_KEY,
     };
     use crate::ai::{
         AiActiveModelSelection, AiAssistantMode, AiChatMessage, AiChatSelectionState, AiConversation,
@@ -8891,6 +10513,203 @@ mod tests {
     use rusqlite::{Connection, TransactionBehavior};
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn sidebar_user_admin_migration_preserves_other_fields_and_secrets() {
+        for legacy_visible in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let storage = crate::persistence::test_storage::open(&directory.path().join("storage.db")).await.unwrap();
+            let originals = vec![
+                ("missing", r#"{"show_database_links":false,"show_native_jobs":true,"future":{"value":42}}"#),
+                ("shown", r#"{"show_user_admin":true,"host":"unchanged"}"#),
+                ("hidden", r#"{"show_user_admin":false}"#),
+                ("broken", "not-json"),
+                ("array", "[]"),
+            ];
+            let inserted = originals.clone();
+            storage.with_conn(move |conn| {
+                for (id, json) in inserted {
+                    conn.execute("INSERT INTO connections (id, config_json) VALUES (?1, ?2)", [id, json]).map_err(|e| e.to_string())?;
+                }
+                conn.execute("INSERT INTO connection_secrets (connection_id, key, secret, secret_enc) VALUES ('missing', 'password', '', 'unchanged-ciphertext')", []).map_err(|e| e.to_string())?;
+                Ok(())
+            }).await.unwrap();
+            storage.migrate_sidebar_user_admin_visibility(legacy_visible).await.unwrap();
+            let (rows, secret) = storage
+                .with_conn(|conn| {
+                    let mut stmt = conn
+                        .prepare("SELECT id, config_json FROM connections ORDER BY id")
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                        .map_err(|e| e.to_string())?
+                        .collect::<Result<BTreeMap<_, _>, _>>()
+                        .map_err(|e| e.to_string())?;
+                    let secret: String = conn
+                        .query_row(
+                            "SELECT secret_enc FROM connection_secrets WHERE connection_id = 'missing'",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    Ok((rows, secret))
+                })
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), originals.len());
+            assert_eq!(secret, "unchanged-ciphertext");
+            for (id, original) in originals {
+                if legacy_visible || id == "broken" || id == "array" {
+                    assert_eq!(rows[id], original);
+                } else {
+                    let mut expected: serde_json::Value = serde_json::from_str(original).unwrap();
+                    expected["show_user_admin"] = serde_json::Value::Bool(false);
+                    assert_eq!(serde_json::from_str::<serde_json::Value>(&rows[id]).unwrap(), expected);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sidebar_user_admin_migration_keeps_later_choices_and_new_connections_after_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("storage.db");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        let mut config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "existing", "name": "Existing", "db_type": "oracle", "host": "localhost",
+            "port": 1521, "username": "test", "password": "", "save_password": false
+        }))
+        .unwrap();
+        storage.save_connections(&[config.clone()]).await.unwrap();
+        storage.migrate_sidebar_user_admin_visibility(false).await.unwrap();
+        assert_eq!(storage.load_connections().await.unwrap()[0].show_user_admin, Some(false));
+        config.show_user_admin = Some(true);
+        let mut added = config.clone();
+        added.id = "new".into();
+        added.show_user_admin = None;
+        storage.save_connections(&[config, added]).await.unwrap();
+        drop(storage);
+        let reopened = crate::persistence::test_storage::open(&path).await.unwrap();
+        reopened.migrate_sidebar_user_admin_visibility(false).await.unwrap();
+        let configs = reopened.load_connections().await.unwrap();
+        assert_eq!(configs.iter().find(|c| c.id == "existing").unwrap().show_user_admin, Some(true));
+        assert_eq!(configs.iter().find(|c| c.id == "new").unwrap().show_user_admin, None);
+    }
+
+    #[tokio::test]
+    async fn sidebar_user_admin_migration_rolls_back_updates_and_marker_before_retry() {
+        for failure in [
+            "CREATE TRIGGER reject_migration BEFORE UPDATE ON connections WHEN OLD.id = 'b' BEGIN SELECT RAISE(ABORT, 'injected update failure'); END;",
+            "CREATE TRIGGER reject_migration BEFORE INSERT ON app_state WHEN NEW.key = 'sidebar_user_admin_visibility_migration_v1' BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END;",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let storage = crate::persistence::test_storage::open(&directory.path().join("storage.db")).await.unwrap();
+            storage.with_conn(move |conn| {
+                conn.execute_batch("INSERT INTO connections (id, config_json) VALUES ('a', '{}'), ('b', '{}');").map_err(|e| e.to_string())?;
+                conn.execute_batch(failure).map_err(|e| e.to_string())
+            }).await.unwrap();
+            assert!(storage.migrate_sidebar_user_admin_visibility(false).await.is_err());
+            storage.with_conn(|conn| {
+                let unchanged: i64 = conn.query_row("SELECT COUNT(*) FROM connections WHERE config_json = '{}'", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+                let marked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM app_state WHERE key = 'sidebar_user_admin_visibility_migration_v1')", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+                assert_eq!(unchanged, 2);
+                assert!(!marked);
+                conn.execute_batch("DROP TRIGGER reject_migration;").map_err(|e| e.to_string())
+            }).await.unwrap();
+            storage.migrate_sidebar_user_admin_visibility(false).await.unwrap();
+            storage.with_conn(|conn| {
+                let changed: i64 = conn.query_row("SELECT COUNT(*) FROM connections WHERE json_extract(config_json, '$.show_user_admin') = 0", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+                assert_eq!(changed, 2);
+                Ok(())
+            }).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sidebar_user_admin_migration_first_client_wins_across_storage_instances() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("storage.db");
+        let first = crate::persistence::test_storage::open(&path).await.unwrap();
+        let second = crate::persistence::test_storage::open(&path).await.unwrap();
+        first
+            .with_conn(|conn| {
+                conn.execute_batch("INSERT INTO connections (id, config_json) VALUES ('a', '{}'), ('b', '{}');")
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(
+            first.migrate_sidebar_user_admin_visibility(false),
+            second.migrate_sidebar_user_admin_visibility(true)
+        );
+        a.unwrap();
+        b.unwrap();
+        let values = first
+            .with_conn(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT config_json FROM connections ORDER BY id").map_err(|e| e.to_string())?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(values[0], values[1]);
+        second.migrate_sidebar_user_admin_visibility(false).await.unwrap();
+        let unchanged = first
+            .with_conn(|conn| {
+                conn.query_row("SELECT config_json FROM connections WHERE id = 'a'", [], |row| row.get::<_, String>(0))
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(unchanged, values[0]);
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
+    async fn mqtt_history_reconciliation_recovers_sent_message_after_initial_append_failure() {
+        use crate::mqtt::types::{MqttMessage, MqttMessageDirection};
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open(&directory.path().join("storage.db")).await.unwrap();
+        storage
+            .with_conn(|connection| {
+                connection
+                    .execute_batch(
+                        "CREATE TRIGGER fail_mqtt_history_insert \
+                         BEFORE INSERT ON state_store \
+                         WHEN NEW.key = 'mqtt.sent_history.retry' \
+                         BEGIN SELECT RAISE(FAIL, 'injected mqtt history failure'); END;",
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+        let message = MqttMessage {
+            topic: "devices/retry".to_string(),
+            payload_base64: "cmV0cnk=".to_string(),
+            payload_text: Some("retry".to_string()),
+            qos: 1,
+            retain: false,
+            received_at_ms: 42,
+            direction: MqttMessageDirection::Sent,
+        };
+
+        assert!(storage.append_mqtt_sent_message("retry", &message).await.is_err());
+        storage
+            .with_conn(|connection| {
+                connection.execute_batch("DROP TRIGGER fail_mqtt_history_insert").map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+
+        storage.reconcile_mqtt_message_history("retry", std::slice::from_ref(&message)).await.unwrap();
+        storage.reconcile_mqtt_message_history("retry", std::slice::from_ref(&message)).await.unwrap();
+
+        let history = storage.load_mqtt_message_history("retry").await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(super::mqtt_history_message_identity(&history[0]), super::mqtt_history_message_identity(&message));
+    }
 
     #[tokio::test]
     async fn migration_scan_cache_recovers_legacy_success_with_stale_counts() {
@@ -9176,7 +10995,8 @@ mod tests {
             .unwrap()
             .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
         let status = reopened.inspect_data_migration().await.unwrap();
-        assert_eq!(status.state, super::MigrationState::Running);
+        assert_eq!(status.state, super::MigrationState::Failed);
+        assert_eq!(status.error_code.as_deref(), Some("MIGRATION_INTERRUPTED"));
         assert!(!status.is_ready());
         reopened.retry_data_migration().await.unwrap();
         assert!(reopened.inspect_data_migration().await.unwrap().is_ready());
@@ -9221,6 +11041,100 @@ mod tests {
         assert_eq!(open_with_resolved_codec(&storage, &envelope).as_deref(), Ok("secret"));
     }
 
+    /// Seeds the read-only error cache the way the startup status probe does
+    /// after a failed platform lookup. The sentinel string cannot be produced
+    /// by a real resolve, so observing it proves the cached error was served
+    /// without consulting the provider again.
+    fn cache_locked_keyring_error(storage: &Storage) {
+        let digests = storage.key_file_digests();
+        storage.cache_secret_key_error("CACHED_KEYRING_LOCKED", digests);
+    }
+
+    async fn storage_with_managed_key(directory: &std::path::Path) -> Storage {
+        let key_path = managed_key_path(directory);
+        std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        std::fs::write(&key_path, "ab".repeat(32)).unwrap();
+        Storage::open_unmigrated(&directory.join("dbx.db"))
+            .await
+            .unwrap()
+            .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir)
+    }
+
+    #[tokio::test]
+    async fn cached_secret_key_error_is_served_to_read_only_resolves() {
+        // One failed startup probe must not be repeated by every subsequent
+        // read-only consumer while the desktop keyring stays locked.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage_with_managed_key(dir.path()).await;
+        cache_locked_keyring_error(&storage);
+        assert_eq!(storage.resolve_secret_key(false).err().unwrap(), "CACHED_KEYRING_LOCKED");
+        assert_eq!(storage.secret_codec(false).err().unwrap(), "CACHED_KEYRING_LOCKED");
+
+        // A key file change invalidates the cached error, so the next
+        // read-only resolve consults the provider again.
+        std::fs::write(managed_key_path(dir.path()), "cd".repeat(32)).unwrap();
+        assert!(storage.secret_codec(false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn successful_resolve_clears_cached_secret_key_error() {
+        // Once any resolve succeeds against a recovered provider, the stale
+        // cached failure must be retired instead of outliving the recovery.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage_with_managed_key(dir.path()).await;
+        cache_locked_keyring_error(&storage);
+        assert_eq!(storage.resolve_secret_key(false).err().unwrap(), "CACHED_KEYRING_LOCKED");
+        // A create-allowed resolve bypasses the read-only guard; its success
+        // drops the cached error for later read-only callers.
+        assert!(storage.resolve_secret_key(true).is_ok());
+        assert!(storage.resolve_secret_key(false).is_ok());
+        assert!(storage.secret_codec(false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn explicit_status_retry_bypasses_cached_error_and_keeps_the_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage_with_managed_key(dir.path()).await;
+        let cached_error = "KEYRING_ACCESS_FAILED: cached locked keyring";
+        storage.cache_secret_key_error(cached_error, storage.key_file_digests());
+
+        let cached = storage.inspect_data_migration().await.unwrap();
+        assert_eq!(cached.error_code.as_deref(), Some("KEYRING_ACCESS_FAILED"));
+        assert_eq!(storage.resolve_secret_key(false).err().unwrap(), cached_error);
+
+        let retried = storage.retry_data_migration_inspection().await.unwrap();
+        assert!(retried.key_provider_available);
+        assert_eq!(retried.key_status, super::MigrationKeyStatus::Ready);
+        assert_eq!(retried.key_source, "managed_data_dir");
+        assert!(storage.resolve_secret_key(false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_status_retry_replaces_the_cached_provider_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage_with_managed_key(dir.path()).await;
+        std::fs::write(managed_key_path(dir.path()), "\n").unwrap();
+        let cached_error = "KEYRING_ACCESS_FAILED: cached locked keyring";
+        storage.cache_secret_key_error(cached_error, storage.key_file_digests());
+
+        assert_eq!(storage.resolve_secret_key(false).err().unwrap(), cached_error);
+        let retried = storage.retry_data_migration_inspection().await.unwrap();
+        assert_eq!(retried.error_code.as_deref(), Some("SECRET_KEY_INVALID"));
+        assert_eq!(storage.resolve_secret_key(false).err().unwrap(), "SECRET_KEY_INVALID");
+    }
+
+    #[tokio::test]
+    async fn start_data_migration_invalidates_cached_secret_key_error() {
+        // Migration must re-probe the live provider instead of trusting a
+        // stale failure cached at startup.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage_with_managed_key(dir.path()).await;
+        cache_locked_keyring_error(&storage);
+        assert_eq!(storage.resolve_secret_key(false).err().unwrap(), "CACHED_KEYRING_LOCKED");
+        storage.start_data_migration().await.unwrap();
+        assert!(storage.secret_codec(false).is_ok());
+    }
+
     #[tokio::test]
     async fn secret_migration_rejects_wrong_or_invalid_managed_keys_without_replacing_them() {
         let directory = tempfile::tempdir().unwrap();
@@ -9255,16 +11169,73 @@ mod tests {
             .unwrap()
             .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
         storage.set_secret("connection", "password", "secret").await.unwrap();
+        storage.set_migration_state(super::MigrationState::Succeeded, None, None, None, None).await.unwrap();
         let key_path = managed_key_path(dir.path());
         std::fs::remove_file(&key_path).unwrap();
 
         let status = storage.inspect_data_migration().await.unwrap();
-        assert!(status.needs_migration);
+        assert_eq!(status.state, super::MigrationState::Succeeded);
+        assert!(!status.needs_migration);
+        assert!(status.key_recovery_required);
+        assert!(!status.is_ready());
         assert!(!status.key_creation_allowed);
         assert_eq!(status.error_code.as_deref(), Some("ENCRYPTED_DATA_KEY_MISSING"));
         assert!(!key_path.exists());
         assert_eq!(storage.start_data_migration().await.unwrap_err(), "ENCRYPTED_DATA_KEY_MISSING");
         assert!(!key_path.exists());
+    }
+
+    #[tokio::test]
+    async fn portable_storage_copies_only_the_matching_platform_key_into_its_data_dir() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open_unmigrated(&directory.path().join("dbx.db"))
+            .await
+            .unwrap()
+            .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
+        let platform_codec = super::SecretCodec::new([7; 32]);
+        let encrypted = platform_codec.encrypt("connection", "password", "portable-secret").unwrap();
+        storage
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT INTO connection_secrets (connection_id, key, secret, secret_enc) VALUES ('connection', 'password', '', ?1)",
+                    [encrypted],
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(storage.prepare_portable_secret_key_with(|| Ok(Some(platform_codec))).await.unwrap());
+        assert!(managed_key_path(directory.path()).is_file());
+        assert_eq!(storage.get_secret("connection", "password").await.unwrap().as_deref(), Some("portable-secret"));
+    }
+
+    #[tokio::test]
+    async fn portable_storage_never_persists_a_platform_key_that_cannot_decrypt_its_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open_unmigrated(&directory.path().join("dbx.db"))
+            .await
+            .unwrap()
+            .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
+        let encrypted = super::SecretCodec::new([7; 32]).encrypt("connection", "password", "portable-secret").unwrap();
+        storage
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT INTO connection_secrets (connection_id, key, secret, secret_enc) VALUES ('connection', 'password', '', ?1)",
+                    [encrypted],
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.prepare_portable_secret_key_with(|| Ok(Some(super::SecretCodec::new([8; 32])))).await.unwrap_err(),
+            "SECRET_KEY_MISMATCH"
+        );
+        assert!(!managed_key_path(directory.path()).exists());
     }
 
     #[tokio::test]
@@ -9519,8 +11490,11 @@ mod tests {
                 covered_messages: None,
                 source_binding: None,
                 selections_omitted: None,
+                loaded_skill_ids: None,
             }],
             queued_input: None,
+            assistant_mode: None,
+            assistant_action: None,
             created_at: updated_at.to_string(),
             updated_at: updated_at.to_string(),
         }
@@ -9839,6 +11813,84 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// #12075 / AC14 — a database created before the picker columns existed must
+    /// upgrade in place, and both conversation upsert paths must carry the new
+    /// values. Tests the real migration (`ensure_ai_conversations_columns_sync`),
+    /// not just serde: the columns have to exist before the INSERT can name them.
+    #[tokio::test]
+    async fn ai_conversation_upgrades_legacy_schema_and_roundtrips_picker_selection() {
+        let path = temp_db_path("ai-conversation-picker-selection");
+        // Pre-#12075 schema: none of the later columns exist yet.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_conversations (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', connection_name TEXT NOT NULL DEFAULT '',
+            database TEXT NOT NULL DEFAULT '', messages_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT ''
+        ); INSERT INTO ai_conversations (id, title) VALUES ('legacy', 'SQL conversation');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        // The legacy row loads with no recorded picker selection — the frontend's
+        // R9 fallback (settings default + default action) is what fills the UI.
+        let legacy = storage.load_ai_conversations().await.unwrap();
+        assert_eq!(legacy[0].title, "SQL conversation");
+        assert!(legacy[0].assistant_mode.is_none());
+        assert!(legacy[0].assistant_action.is_none());
+
+        // Path 1: the plain conversation upsert.
+        let mut conversation = ai_conversation("picker-conv", "0001");
+        conversation.assistant_mode = Some("agent".to_string());
+        conversation.assistant_action = Some("auto".to_string());
+        storage.save_ai_conversation(&conversation).await.unwrap();
+
+        let loaded = storage.load_ai_conversations().await.unwrap();
+        let saved = loaded.iter().find(|item| item.id == "picker-conv").unwrap();
+        assert_eq!(saved.assistant_mode.as_deref(), Some("agent"));
+        // `auto` is the recorded picker entry, not a routed concrete action (R8).
+        assert_eq!(saved.assistant_action.as_deref(), Some("auto"));
+
+        // Path 2: the conversation+run upsert used by background runs.
+        let mut run_conversation = ai_conversation("run-conv", "0002");
+        run_conversation.assistant_mode = Some("ask".to_string());
+        run_conversation.assistant_action = Some("optimize".to_string());
+        let run = ai_run("run-1", "run-conv", AiRunStatus::Running, "0002");
+        storage.save_ai_run_state(&run_conversation, &run).await.unwrap();
+
+        let loaded = storage.load_ai_conversations().await.unwrap();
+        let saved = loaded.iter().find(|item| item.id == "run-conv").unwrap();
+        assert_eq!(saved.assistant_mode.as_deref(), Some("ask"));
+        assert_eq!(saved.assistant_action.as_deref(), Some("optimize"));
+        // The legacy row is still there, still without a recorded selection.
+        let legacy = loaded.iter().find(|item| item.id == "legacy").unwrap();
+        assert!(legacy.assistant_mode.is_none());
+        assert!(legacy.assistant_action.is_none());
+
+        // Clearing the picker selection (a future "forget the choice" path) writes
+        // NULL rather than a stale value.
+        conversation.assistant_mode = None;
+        conversation.assistant_action = None;
+        storage.save_ai_conversation(&conversation).await.unwrap();
+        let loaded = storage.load_ai_conversations().await.unwrap();
+        let saved = loaded.iter().find(|item| item.id == "picker-conv").unwrap();
+        assert!(saved.assistant_mode.is_none());
+        assert!(saved.assistant_action.is_none());
+
+        // A record written before the fields existed still deserializes; the JSON
+        // boundary is what the cloud-sync / web transports carry.
+        let legacy_json: AiConversation = serde_json::from_str(r#"{"id":"old","title":"Old","connectionName":"","connectionId":"","database":"","messages":[],"createdAt":"0000","updatedAt":"0000"}"#).unwrap();
+        assert!(legacy_json.assistant_mode.is_none());
+        assert!(legacy_json.assistant_action.is_none());
+        // `None` is skipped entirely, so an old reader sees the record it always saw.
+        let serialized = serde_json::to_value(&legacy_json).unwrap();
+        assert!(serialized.get("assistantMode").is_none());
+        assert!(serialized.get("assistantAction").is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
     // #10058: a turn that carried a context selection keeps only a footprint in
     // storage — the selection text is session-only. The record must round-trip
     // that boolean, and a record written before the field existed must load.
@@ -9858,6 +11910,36 @@ mod tests {
 
         let legacy: AiChatMessage = serde_json::from_str(r#"{"role":"user","content":"old turn"}"#).unwrap();
         assert!(legacy.selections_omitted.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    // prd 09-30 Req 13: a conversation keeps the FACT that skills were loaded so
+    // the panel can light its chips after a restart. The body itself is
+    // deliberately not part of the record — see the field comment in
+    // `dbx-ai-provider`. This pins both halves: the ids round-trip, and a record
+    // written before the field existed still loads.
+    #[tokio::test]
+    async fn ai_conversation_roundtrips_loaded_skill_ids() {
+        let path = temp_db_path("ai-conversation-loaded-skills");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+
+        let mut conversation = ai_conversation("skills-conv", "0000");
+        conversation.messages[0].loaded_skill_ids = Some(vec!["d-abc".to_string(), "c-def".to_string()]);
+        storage.save_ai_conversation(&conversation).await.unwrap();
+
+        let loaded = storage.load_ai_conversations().await.unwrap();
+        assert_eq!(
+            loaded[0].messages[0].loaded_skill_ids.as_deref(),
+            Some(["d-abc".to_string(), "c-def".to_string()].as_slice())
+        );
+        // No body: the stored message is exactly the id list.
+        let stored = serde_json::to_value(&loaded[0].messages[0]).unwrap();
+        assert!(stored.get("loadedSkillIds").and_then(|value| value.as_array()).is_some());
+        assert!(stored.get("toolCalls").is_none());
+
+        let legacy: AiChatMessage = serde_json::from_str(r#"{"role":"assistant","content":"old turn"}"#).unwrap();
+        assert!(legacy.loaded_skill_ids.is_none());
 
         let _ = std::fs::remove_file(path);
     }
@@ -10360,12 +12442,122 @@ mod tests {
             key_passphrase: String::new(),
             connect_timeout_secs: 5,
             expose_lan: false,
+            local_port: None,
             use_ssh_agent: false,
             ssh_agent_sock_path: String::new(),
+            ssh_agent_key_fingerprint: String::new(),
             auth_method: "password".to_string(),
             allow_exec_channel_proxy: false,
+            proxy_command: String::new(),
             profile_id: String::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn tunnel_profiles_guarded_prepare_and_stale_commit_do_not_migrate_or_create_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage =
+            crate::persistence::test_storage::open_unmigrated(&directory.path().join("dbx.db")).await.unwrap();
+        let stale = storage.load_tunnel_profile_save_snapshot().await.unwrap();
+        let inline = ssh_profile("inline", "inline-secret");
+        let legacy = ssh_profile("legacy", "legacy-secret");
+        let mut scrubbed = legacy.clone();
+        scrubbed.scrub_secrets();
+        let inline_json = serde_json::to_string(&inline).unwrap();
+        let metadata_json = serde_json::to_string(&scrubbed).unwrap();
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        storage.with_conn(move |conn| {
+            conn.execute("INSERT INTO tunnel_profiles (id, config_json) VALUES ('inline', ?1), ('legacy', ?2)", rusqlite::params![inline_json, metadata_json]).map_err(|e| e.to_string())?;
+            conn.execute("INSERT INTO connection_secrets (connection_id, key, secret) VALUES ('tunnel_profile.legacy', 'config', ?1)", rusqlite::params![legacy_json]).map_err(|e| e.to_string())?;
+            Ok(())
+        }).await.unwrap();
+        let expected_profiles = vec![inline, legacy];
+        let expected = storage.load_tunnel_profile_save_snapshot().await.unwrap();
+        let key_path = crate::persistence::secret_codec::managed_key_path(directory.path());
+        assert!(!key_path.exists());
+        assert_eq!(expected.profiles, expected_profiles);
+        let replacement = ssh_profile("new", "new-secret");
+        assert!(!storage.save_tunnel_profiles_if_unchanged(&stale, std::slice::from_ref(&replacement)).await.unwrap());
+        assert!(!key_path.exists());
+        let raw = storage.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*), SUM(CASE WHEN secret <> '' AND (secret_enc IS NULL OR secret_enc = '') THEN 1 ELSE 0 END) FROM connection_secrets WHERE connection_id LIKE 'tunnel_profile.%'", [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).map_err(|e| e.to_string())
+        }).await.unwrap();
+        assert_eq!(raw, (1, 1));
+        assert_eq!(storage.load_tunnel_profiles_readonly().await.unwrap(), expected_profiles);
+        let saved = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            storage.save_tunnel_profiles_if_unchanged(&expected, std::slice::from_ref(&replacement)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(saved);
+        assert!(key_path.exists());
+        assert_eq!(storage.load_tunnel_profiles_readonly().await.unwrap(), vec![replacement]);
+    }
+
+    #[tokio::test]
+    async fn tunnel_profiles_raw_baseline_covers_discarded_rows_and_preserves_similar_namespaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage =
+            crate::persistence::test_storage::open_unmigrated(&directory.path().join("dbx.db")).await.unwrap();
+        let same = serde_json::to_string(&ssh_profile("same", "")).unwrap();
+        let mismatched = serde_json::to_string(&ssh_profile("json-id", "")).unwrap();
+        storage.with_conn(move |conn| {
+            conn.execute("INSERT INTO tunnel_profiles (id, config_json) VALUES ('same', ?1), ('db-row', ?2), ('broken', '{')", rusqlite::params![same, mismatched]).map_err(|e| e.to_string())?;
+            for (namespace, key, value) in [
+                ("tunnel_profile.same", "extra", "extra-value"),
+                ("tunnel_profile.orphan", "config", "orphan-value"),
+                ("tunnelXprofile.P", "extra", "keep-1"),
+                ("tunnel_profileX.P", "extra", "keep-2"),
+                ("TUNNEL_PROFILE.P", "extra", "keep-3"),
+            ] {
+                conn.execute("INSERT INTO connection_secrets (connection_id, key, secret) VALUES (?1, ?2, ?3)", rusqlite::params![namespace, key, value]).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }).await.unwrap();
+        let expected = storage.load_tunnel_profile_save_snapshot().await.unwrap();
+        assert_eq!(expected.discarded_profile_ids(), vec!["broken", "db-row", "orphan", "same"]);
+        storage
+            .with_conn(|conn| {
+                conn.execute("UPDATE tunnel_profiles SET config_json = '[' WHERE id = 'broken'", [])
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+        let changed = storage.load_tunnel_profile_save_snapshot().await.unwrap();
+        assert_eq!(changed.profiles, expected.profiles);
+        assert!(!storage.save_tunnel_profiles_if_unchanged(&expected, &expected.profiles).await.unwrap());
+        let key_path = crate::persistence::secret_codec::managed_key_path(directory.path());
+        assert!(!key_path.exists());
+        assert!(storage.save_tunnel_profiles_if_unchanged(&changed, &changed.profiles).await.unwrap());
+        let raw = storage
+            .with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT connection_id, secret FROM connection_secrets ORDER BY connection_id COLLATE BINARY",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            raw,
+            vec![
+                ("TUNNEL_PROFILE.P".into(), "keep-3".into()),
+                ("tunnelXprofile.P".into(), "keep-1".into()),
+                ("tunnel_profileX.P".into(), "keep-2".into())
+            ]
+        );
+        assert!(!key_path.exists());
+        let final_snapshot = storage.load_tunnel_profile_save_snapshot().await.unwrap();
+        assert_eq!(final_snapshot.profiles, changed.profiles);
+        assert!(final_snapshot.discarded_profile_ids().is_empty());
     }
 
     #[tokio::test]
@@ -10406,6 +12598,7 @@ mod tests {
             enabled: true,
             url: "https://bastion.example.com".to_string(),
             token: "tunnel-token".to_string(),
+            protocol: crate::models::connection::HttpTunnelProtocol::DbxTcp,
             connect_timeout_secs: 5,
             profile_id: String::new(),
         });
@@ -10653,6 +12846,8 @@ mod tests {
 
     fn mq_connection(id: &str, token: &str) -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: id.to_string(),
             name: "Pulsar".to_string(),
@@ -10673,6 +12868,9 @@ mod tests {
             visible_schemas: None,
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
+            show_database_links: None,
+            show_native_jobs: None,
+            show_user_admin: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -10680,6 +12878,8 @@ mod tests {
             connect_timeout_secs: 30,
             query_timeout_secs: 300,
             idle_timeout_secs: 600,
+            manual_transaction_timeout_secs: 300,
+            idle_disconnect_secs: 0,
             keepalive_interval_secs: crate::models::connection::default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
@@ -10699,6 +12899,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -10722,12 +12923,15 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
         }
     }
 
     fn nacos_connection(id: &str, password: &str) -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: id.to_string(),
             name: "Nacos".to_string(),
@@ -10748,6 +12952,9 @@ mod tests {
             visible_schemas: None,
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
+            show_database_links: None,
+            show_native_jobs: None,
+            show_user_admin: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -10755,6 +12962,8 @@ mod tests {
             connect_timeout_secs: 30,
             query_timeout_secs: 300,
             idle_timeout_secs: 600,
+            manual_transaction_timeout_secs: 300,
+            idle_disconnect_secs: 0,
             keepalive_interval_secs: crate::models::connection::default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
@@ -10774,6 +12983,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -10798,6 +13008,7 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
         }
     }
@@ -10951,7 +13162,10 @@ mod tests {
         let target_dir = temp_data_dir("import-empty-target");
         std::fs::create_dir_all(managed_key_path(&target_dir).parent().unwrap()).unwrap();
         std::fs::copy(managed_key_path(&source_dir), managed_key_path(&target_dir)).unwrap();
-        let _target_storage = crate::persistence::test_storage::open(&target_dir.join("dbx.db")).await.unwrap();
+        // 打开一次以创建空目标库；导入前必须释放，否则 Windows 上目标文件被占用、
+        // 替换会失败（与相邻用例一致）。
+        let target_storage = crate::persistence::test_storage::open(&target_dir.join("dbx.db")).await.unwrap();
+        drop(target_storage);
 
         let result = maybe_import_user_data_db(&target_dir, Some(&source_dir)).unwrap();
 
@@ -11144,6 +13358,70 @@ mod tests {
         assert_eq!(loaded, vec![replacement]);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn rocketmq_sqlite_load_migrates_legacy_and_rewrites_metadata() {
+        let path = temp_db_path("rocketmq-legacy-load");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        let mut config = mq_connection("rocket", "");
+        config.external_config =
+            Some(serde_json::json!({"systemKind":"rocketmq", "extra":{"access_key":"ak", "secret_key":"legacy-sk"}}));
+        let json = serde_json::to_string(&config).unwrap();
+        storage
+            .with_conn(move |conn| {
+                conn.execute("INSERT INTO connections (id, config_json) VALUES ('rocket', ?1)", [json])
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+        let loaded = storage.load_connections().await.unwrap();
+        assert_eq!(
+            loaded[0].external_config.as_ref().unwrap()["auth"],
+            serde_json::json!({"kind":"basic", "username":"ak", "password":"legacy-sk"})
+        );
+        assert_eq!(
+            storage.get_secret("rocket", super::MQ_AUTH_PASSWORD_KEY).await.unwrap().as_deref(),
+            Some("legacy-sk")
+        );
+        let raw = raw_connection_json(&storage, "rocket").await;
+        assert!(!raw.contains("legacy-sk"));
+        assert!(!raw.contains("secret_key"));
+        assert_eq!(storage.load_connections().await.unwrap(), loaded);
+    }
+
+    #[tokio::test]
+    async fn rocketmq_sqlite_save_normalizes_and_drops_transient_secrets() {
+        let path = temp_db_path("rocketmq-save");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        let mut config = mq_connection("rocket", "");
+        config.external_config =
+            Some(serde_json::json!({"systemKind":"rocketmq", "extra":{"accessKey":"ak", "secretKey":"sk"}}));
+        storage.save_connections(std::slice::from_ref(&config)).await.unwrap();
+        assert_eq!(storage.get_secret("rocket", super::MQ_AUTH_PASSWORD_KEY).await.unwrap().as_deref(), Some("sk"));
+        let raw = raw_connection_json(&storage, "rocket").await;
+        assert!(!raw.contains("secretKey"));
+        config.save_password = false;
+        storage.save_connections(&[config]).await.unwrap();
+        assert!(storage.get_secret("rocket", super::MQ_AUTH_PASSWORD_KEY).await.unwrap().is_none());
+        let loaded = storage.load_connections().await.unwrap();
+        assert_eq!(loaded[0].external_config.as_ref().unwrap()["auth"]["password"], "");
+    }
+
+    #[tokio::test]
+    async fn rocketmq_sqlite_explicit_none_discards_legacy_copies() {
+        let path = temp_db_path("rocketmq-none");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        let mut config = mq_connection("rocket", "");
+        config.external_config =
+            Some(serde_json::json!({"systemKind":"rocketmq", "auth":{"kind":"none"}, "extra":{"secretKey":"old"}}));
+        storage.set_secret("rocket", super::MQ_AUTH_PASSWORD_KEY, "stale").await.unwrap();
+        storage.save_connections(&[config]).await.unwrap();
+        assert!(storage.get_secret("rocket", super::MQ_AUTH_PASSWORD_KEY).await.unwrap().is_none());
+        let loaded = storage.load_connections().await.unwrap();
+        assert_eq!(loaded[0].external_config.as_ref().unwrap()["auth"], serde_json::json!({"kind":"none"}));
+        assert!(!raw_connection_json(&storage, "rocket").await.contains("secretKey"));
     }
 
     #[tokio::test]
@@ -11603,12 +13881,15 @@ mod tests {
                 configured: false,
                 read_only: false,
                 allow_dangerous_sql: false,
+                prompt_high_risk_sql: false,
+                call_confirmation: None,
                 allowed_connection_ids: None,
                 allowed_group_ids: Vec::new(),
                 allowed_tool_names: None,
                 connection_policies: Vec::new(),
                 group_policies: Vec::new(),
                 query_timeout_secs: None,
+                plugin_tools_mode: crate::mcp_access::McpPluginToolsMode::Flat,
             }
         );
 
@@ -11630,12 +13911,15 @@ mod tests {
                 configured: true,
                 read_only: true,
                 allow_dangerous_sql: false,
+                prompt_high_risk_sql: false,
+                call_confirmation: None,
                 allowed_connection_ids: Some(vec!["conn-1".to_string(), "conn-2".to_string()]),
                 allowed_group_ids: Vec::new(),
                 allowed_tool_names: None,
                 connection_policies: Vec::new(),
                 group_policies: Vec::new(),
                 query_timeout_secs: Some(120),
+                plugin_tools_mode: crate::mcp_access::McpPluginToolsMode::Flat,
             }
         );
         assert_eq!(storage.load_password_hash().await.unwrap().as_deref(), Some("preserved"));
@@ -11648,6 +13932,119 @@ mod tests {
 
         storage.save_desktop_settings(&DesktopSettings::default()).await.unwrap();
         assert!(storage.load_mcp_global_policy().await.unwrap().read_only);
+    }
+
+    #[tokio::test]
+    async fn mcp_plugin_tools_mode_preserves_new_saved_and_legacy_policies() {
+        use crate::mcp_access::{McpAccessPolicy, McpPluginToolsMode};
+        let path = temp_db_path("mcp-plugin-tools-mode");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        assert_eq!(McpAccessPolicy::default().plugin_tools_mode, McpPluginToolsMode::Flat);
+        assert_eq!(storage.load_mcp_global_policy().await.unwrap().plugin_tools_mode, McpPluginToolsMode::Flat);
+        assert_eq!(storage.load_mcp_access_policy().await.unwrap().plugin_tools_mode, McpPluginToolsMode::Flat);
+        // Unrelated saved settings do not turn a fresh MCP policy into a legacy one.
+        storage.save_password_hash("preserved").await.unwrap();
+        assert_eq!(storage.load_enforced_mcp_policy().await.unwrap().plugin_tools_mode, McpPluginToolsMode::Flat);
+
+        for mode in [McpPluginToolsMode::Auto, McpPluginToolsMode::Flat, McpPluginToolsMode::Lazy] {
+            storage
+                .save_mcp_global_policy(&McpGlobalPolicy { plugin_tools_mode: mode, ..Default::default() })
+                .await
+                .unwrap();
+            let access = storage.load_mcp_access_policy().await.unwrap();
+            assert_eq!(access.plugin_tools_mode, mode);
+            storage.save_mcp_access_policy(&access).await.unwrap();
+            assert_eq!(storage.load_mcp_global_policy().await.unwrap().plugin_tools_mode, mode);
+            assert_eq!(storage.load_enforced_mcp_policy().await.unwrap().plugin_tools_mode, mode);
+        }
+
+        for (key, mut value) in [
+            (MCP_GLOBAL_POLICY_KEY, serde_json::to_value(McpGlobalPolicy::default()).unwrap()),
+            (MCP_ACCESS_POLICY_KEY, serde_json::to_value(McpAccessPolicy::default()).unwrap()),
+        ] {
+            value.as_object_mut().unwrap().remove("pluginToolsMode");
+            let settings = serde_json::Map::from_iter([(key.to_string(), value)]);
+            // Seed the old persisted shape directly; the generic settings
+            // writer intentionally preserves the dedicated MCP policy keys.
+            storage.with_conn(move |conn| write_app_settings_map(conn, &settings)).await.unwrap();
+            let access = storage.load_mcp_access_policy().await.unwrap();
+            assert_eq!(access.plugin_tools_mode, McpPluginToolsMode::Auto, "legacy {key}");
+            assert_eq!(storage.load_enforced_mcp_policy().await.unwrap().plugin_tools_mode, McpPluginToolsMode::Auto);
+            storage.save_mcp_access_policy(&access).await.unwrap();
+            assert_eq!(storage.load_mcp_global_policy().await.unwrap().plugin_tools_mode, McpPluginToolsMode::Auto);
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_call_safety_preserves_legacy_storage_until_explicit_migration() {
+        use crate::mcp_access::{McpAccessPolicy, McpConfirmPolicy};
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open(&root.path().join("storage.db")).await.unwrap();
+        for key in [MCP_GLOBAL_POLICY_KEY, MCP_ACCESS_POLICY_KEY] {
+            let value = if key == MCP_GLOBAL_POLICY_KEY {
+                serde_json::json!({"readOnly": false, "promptHighRiskSql": true})
+            } else {
+                serde_json::json!({"version": 2, "defaultAccess": "write", "confirm": "full"})
+            };
+            let settings = serde_json::Map::from_iter([(key.to_string(), value)]);
+            storage.with_conn(move |conn| write_app_settings_map(conn, &settings)).await.unwrap();
+            assert_eq!(
+                storage.load_enforced_mcp_policy().await.unwrap().policy().confirmation_policy(),
+                McpConfirmPolicy::Full
+            );
+            let mut policy = storage.load_enforced_mcp_policy().await.unwrap().policy();
+            policy.query_timeout_secs = Some(20);
+            storage.save_mcp_global_policy(&policy).await.unwrap();
+            assert_eq!(storage.load_mcp_access_policy().await.unwrap().confirm, McpConfirmPolicy::Full);
+            policy.call_confirmation = Some(McpConfirmPolicy::HighRisk);
+            storage.save_mcp_global_policy(&policy).await.unwrap();
+            let saved = storage.load_mcp_global_policy().await.unwrap().policy();
+            assert!(!saved.prompt_high_risk_sql);
+            assert_eq!(saved.confirmation_policy(), McpConfirmPolicy::HighRisk);
+            let access = storage.load_mcp_access_policy().await.unwrap();
+            storage.save_mcp_access_policy(&access).await.unwrap();
+            assert_eq!(storage.load_enforced_mcp_policy().await.unwrap().policy(), saved);
+            assert_eq!(McpAccessPolicy::from_v1(&saved).confirm, McpConfirmPolicy::HighRisk);
+            policy.call_confirmation = Some(McpConfirmPolicy::Off);
+            storage.save_mcp_global_policy(&policy).await.unwrap();
+            assert_eq!(storage.load_mcp_access_policy().await.unwrap().confirm, McpConfirmPolicy::Off);
+        }
+    }
+
+    #[test]
+    fn legacy_mcp_policy_does_not_enable_high_risk_prompts() {
+        let policy: McpGlobalPolicy =
+            serde_json::from_str(r#"{"readOnly":false,"allowDangerousSql":false,"allowedConnectionIds":null}"#)
+                .unwrap();
+        assert!(!policy.prompt_high_risk_sql);
+        assert!(!policy.normalized().prompt_high_risk_sql);
+    }
+
+    #[tokio::test]
+    async fn mcp_confirmation_survives_read_only_default_with_resource_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open(&root.path().join("storage.db")).await.unwrap();
+        let policy = McpGlobalPolicy {
+            read_only: true,
+            prompt_high_risk_sql: true,
+            connection_policies: vec![serde_json::from_value(serde_json::json!({
+                "connectionId": "dev", "readOnly": false,
+                "executionModeConfigured": true, "executionModePolicyVersion": 1
+            }))
+            .unwrap()],
+            ..Default::default()
+        };
+        storage.save_mcp_global_policy(&policy).await.unwrap();
+        let saved = storage.load_mcp_global_policy().await.unwrap().policy();
+        let enforced = storage.load_enforced_mcp_policy().await.unwrap().policy();
+        for value in [saved, enforced] {
+            assert!(value.read_only);
+            assert!(value.prompt_high_risk_sql);
+            assert!(!value.allow_dangerous_sql);
+        }
+        let access = storage.load_mcp_access_policy().await.unwrap();
+        assert_eq!(access.resolve(&[], "other", None).level, crate::mcp_access::McpAccessLevel::Read);
+        assert_eq!(access.resolve(&[], "dev", None).level, crate::mcp_access::McpAccessLevel::Write);
     }
 
     #[tokio::test]
@@ -11996,6 +14393,7 @@ mod tests {
         storage
             .save_desktop_settings(&DesktopSettings {
                 show_tray_icon: false,
+                linux_floating_frame_enabled: true,
                 icon_theme: DesktopIconTheme::Black,
                 quit_on_close: true,
                 close_action_prompted: false,
@@ -12009,6 +14407,7 @@ mod tests {
                 agent_store_dir: Some("/tmp/dbx-agents".to_string()),
                 custom_ai_skill_root_enabled: DesktopSettings::default().custom_ai_skill_root_enabled,
                 custom_ai_skill_root: None,
+                custom_ai_skill_auto_enabled: DesktopSettings::default().custom_ai_skill_auto_enabled,
                 sidebar_table_page_size: DesktopSettings::default().sidebar_table_page_size,
             })
             .await
@@ -12019,6 +14418,7 @@ mod tests {
             storage.load_desktop_settings().await.unwrap(),
             DesktopSettings {
                 show_tray_icon: false,
+                linux_floating_frame_enabled: true,
                 icon_theme: DesktopIconTheme::Black,
                 quit_on_close: true,
                 close_action_prompted: false,
@@ -12032,6 +14432,7 @@ mod tests {
                 agent_store_dir: Some("/tmp/dbx-agents".to_string()),
                 custom_ai_skill_root_enabled: DesktopSettings::default().custom_ai_skill_root_enabled,
                 custom_ai_skill_root: None,
+                custom_ai_skill_auto_enabled: DesktopSettings::default().custom_ai_skill_auto_enabled,
                 sidebar_table_page_size: DesktopSettings::default().sidebar_table_page_size,
             }
         );
@@ -12077,6 +14478,42 @@ mod tests {
         assert_eq!(raw.get("custom_ai_skill_root"), None);
     }
 
+    /// Req 5's toggle defaults off, so a database written before it existed (the
+    /// key absent) must load as off rather than as "unset means on".
+    #[tokio::test]
+    async fn desktop_settings_roundtrip_custom_ai_skill_auto_enabled() {
+        let path = temp_db_path("desktop-settings-custom-ai-skill-auto");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+
+        assert!(!storage.load_desktop_settings().await.unwrap().custom_ai_skill_auto_enabled);
+
+        storage
+            .save_desktop_settings(&DesktopSettings {
+                custom_ai_skill_auto_enabled: true,
+                ..DesktopSettings::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(storage.load_desktop_settings().await.unwrap().custom_ai_skill_auto_enabled);
+        let raw = storage.load_app_settings_json().await.unwrap();
+        assert_eq!(raw.get("custom_ai_skill_auto_enabled").and_then(|value| value.as_bool()), Some(true));
+
+        storage
+            .save_desktop_settings(&DesktopSettings {
+                custom_ai_skill_auto_enabled: false,
+                ..DesktopSettings::default()
+            })
+            .await
+            .unwrap();
+        assert!(!storage.load_desktop_settings().await.unwrap().custom_ai_skill_auto_enabled);
+
+        // An explicit `false` is written through (not removed), which is what
+        // keeps a synced record distinguishable from "never configured".
+        let raw = storage.load_app_settings_json().await.unwrap();
+        assert_eq!(raw.get("custom_ai_skill_auto_enabled").and_then(|value| value.as_bool()), Some(false));
+    }
+
     #[tokio::test]
     async fn desktop_settings_save_removes_legacy_background_preference() {
         let path = temp_db_path("desktop-settings-remove-legacy-background");
@@ -12102,6 +14539,21 @@ mod tests {
             settings.get("sidebar_table_page_size").and_then(|value| value.as_u64()),
             Some(DesktopSettings::default().sidebar_table_page_size as u64)
         );
+    }
+
+    #[tokio::test]
+    async fn desktop_settings_persist_linux_floating_frame_preference() {
+        let path = temp_db_path("desktop-settings-linux-floating-frame");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        assert!(storage.load_desktop_settings().await.unwrap().linux_floating_frame_enabled);
+        for enabled in [false, true] {
+            let settings = DesktopSettings { linux_floating_frame_enabled: enabled, ..DesktopSettings::default() };
+            storage.save_desktop_settings(&settings).await.unwrap();
+            assert_eq!(storage.load_desktop_settings().await.unwrap().linux_floating_frame_enabled, enabled);
+        }
+        let mut legacy = serde_json::to_value(DesktopSettings::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("linux_floating_frame_enabled");
+        assert!(serde_json::from_value::<DesktopSettings>(legacy).unwrap().linux_floating_frame_enabled);
     }
 
     #[tokio::test]
@@ -12207,6 +14659,320 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_mcp_grants_round_trip_and_survive_settings_rewrites() {
+        let path = temp_db_path("plugin-mcp-grants");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        assert!(storage.load_plugin_mcp_grants().await.unwrap().is_empty());
+
+        let grant = PluginMcpGrant {
+            external: true,
+            ceiling: PluginMcpAccessLevel::Write,
+            approved_tools: [
+                (" list_dir ".to_string(), PluginMcpAccessLevel::Read),
+                ("".to_string(), PluginMcpAccessLevel::Full),
+            ]
+            .into(),
+            disabled_tools: vec!["b".to_string(), " a ".to_string(), "b".to_string(), " ".to_string()],
+        };
+        let saved = storage.save_plugin_mcp_grant("io.dbx.ssh", grant).await.unwrap();
+        assert_eq!(saved.approved_tools.keys().collect::<Vec<_>>(), ["list_dir"], "names are trimmed, blanks dropped");
+        assert_eq!(saved.disabled_tools, ["a", "b"]);
+        storage
+            .save_plugin_mcp_grant(
+                "io.dbx.k8s",
+                PluginMcpGrant {
+                    external: false,
+                    ceiling: PluginMcpAccessLevel::Read,
+                    approved_tools: Default::default(),
+                    disabled_tools: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        // Whole-map settings writers keep the dedicated key.
+        storage.save_app_settings_json(&serde_json::Map::new()).await.unwrap();
+        let grants = storage.load_plugin_mcp_grants().await.unwrap();
+        assert_eq!(grants.get("io.dbx.ssh"), Some(&saved));
+        assert!(!grants["io.dbx.k8s"].external);
+
+        // Uninstall forgets only that plugin.
+        storage.forget_plugin_permissions("io.dbx.ssh").await.unwrap();
+        let grants = storage.load_plugin_mcp_grants().await.unwrap();
+        assert!(!grants.contains_key("io.dbx.ssh"));
+        assert!(grants.contains_key("io.dbx.k8s"));
+        assert!(storage.save_plugin_mcp_grant(" ", saved).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mcp_visibility_and_database_edits_do_not_grant_dml_or_keep_stale_scopes() {
+        let storage = crate::persistence::test_storage::open(&temp_db_path("mcp-review-roundtrip")).await.unwrap();
+        let mut policy =
+            McpGlobalPolicy { allowed_connection_ids: Some(vec!["sf".into(), "sql".into()]), ..Default::default() };
+        storage.save_mcp_global_policy(&policy).await.unwrap();
+        assert!(!crate::mcp_policy::connection_allows_salesforce_dml(
+            &storage.load_enforced_mcp_policy().await.unwrap().policy(),
+            "sf"
+        ));
+        policy.connection_policies.push(
+            serde_json::from_value(serde_json::json!({
+                "connectionId": "sql", "executionModeConfigured": false, "executionModePolicyVersion": 1,
+                "databaseScope": "selected", "allowedDatabases": ["one"]
+            }))
+            .unwrap(),
+        );
+        storage.save_mcp_global_policy(&policy).await.unwrap();
+        assert!(!storage.load_mcp_access_policy().await.unwrap().sub_scope_visible("sql", "database", "two"));
+        policy.connection_policies.clear();
+        storage.save_mcp_global_policy(&policy).await.unwrap();
+        assert!(storage.load_mcp_access_policy().await.unwrap().sub_scope_visible("sql", "database", "two"));
+        assert!(!crate::mcp_policy::connection_allows_salesforce_dml(
+            &storage.load_enforced_mcp_policy().await.unwrap().policy(),
+            "sf"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_legacy_salesforce_opt_in_migrates_from_saved_v1_evidence() {
+        use crate::mcp_access::{McpAccessPolicy, McpRuleTarget, SALESFORCE_WRITE_TOOLSET};
+        let storage = crate::persistence::test_storage::open(&temp_db_path("mcp-legacy-dml")).await.unwrap();
+        for allowed in [false, true] {
+            let legacy: McpGlobalPolicy = serde_json::from_value(serde_json::json!({
+                "readOnly": false,
+                "connectionPolicies": [{"connectionId": "sf", "allowSalesforceDml": allowed,
+                    "readOnly": false, "executionModeConfigured": true, "executionModePolicyVersion": 1}]
+            }))
+            .unwrap();
+            let mut old_v2 = McpAccessPolicy::from_v1(&legacy);
+            old_v2
+                .rules
+                .get_mut(&McpRuleTarget::Connection { id: "sf".into() })
+                .unwrap()
+                .toolset_ceilings
+                .remove(SALESFORCE_WRITE_TOOLSET);
+            let v1_json = serde_json::to_value(&legacy).unwrap();
+            let v2_json = serde_json::to_value(&old_v2).unwrap();
+            storage
+                .with_conn(move |conn| {
+                    let mut settings = app_settings_map_from_conn(conn)?;
+                    settings.insert(MCP_GLOBAL_POLICY_KEY.into(), v1_json);
+                    settings.insert(MCP_ACCESS_POLICY_KEY.into(), v2_json);
+                    write_app_settings_map(conn, &settings)
+                })
+                .await
+                .unwrap();
+            let access = storage.load_mcp_access_policy().await.unwrap();
+            assert_eq!(crate::mcp_policy::connection_allows_salesforce_dml(&access.to_v1(), "sf"), allowed);
+            storage.save_mcp_access_policy(&access).await.unwrap();
+            assert_eq!(
+                crate::mcp_policy::connection_allows_salesforce_dml(
+                    &storage.load_enforced_mcp_policy().await.unwrap().policy(),
+                    "sf"
+                ),
+                allowed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_explicit_recovery_backs_up_corruption_and_denies_all_tools() {
+        let storage = crate::persistence::test_storage::open(&temp_db_path("mcp-recovery")).await.unwrap();
+        storage.save_mcp_global_policy(&McpGlobalPolicy::default()).await.unwrap();
+        assert!(storage.reset_invalid_mcp_access_policy().await.is_err());
+        storage
+            .with_conn(|conn| {
+                let mut settings = app_settings_map_from_conn(conn)?;
+                settings.insert(MCP_ACCESS_POLICY_KEY.into(), serde_json::json!({"broken": true}));
+                settings.insert("unrelated".into(), serde_json::json!(42));
+                write_app_settings_map(conn, &settings)
+            })
+            .await
+            .unwrap();
+        assert!(storage.load_enforced_mcp_policy().await.is_err());
+        storage.reset_invalid_mcp_access_policy().await.unwrap();
+        let access = storage.load_mcp_access_policy().await.unwrap();
+        assert!(!access.connection_visible(&[], "any"));
+        assert_eq!(access.allowed_tool_names, Some(vec![]));
+        let settings = storage.load_app_settings_json().await.unwrap();
+        assert_eq!(settings["unrelated"], 42);
+        let backup = settings.iter().find(|(key, _)| key.starts_with("mcp_policy_recovery_backup_")).unwrap().1;
+        assert_eq!(backup["v2"], serde_json::json!({"broken": true}));
+        assert!(backup["v1"].is_object());
+        let before = settings;
+        assert!(storage.reset_invalid_mcp_access_policy().await.is_err());
+        assert_eq!(storage.load_app_settings_json().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn mcp_v1_save_rejects_invalid_v2_without_overwriting_either_policy() {
+        let path = temp_db_path("mcp-invalid-v2-draft");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        storage.save_mcp_global_policy(&McpGlobalPolicy::default()).await.unwrap();
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!({ "version": 2, "defaultAccess": "invalid" }),
+            serde_json::json!({ "version": 2, "rules": [{ "target": { "kind": "unknown" } }] }),
+        ] {
+            storage
+                .with_conn(move |conn| {
+                    let mut settings = app_settings_map_from_conn(conn)?;
+                    settings.insert(super::MCP_ACCESS_POLICY_KEY.to_string(), invalid);
+                    write_app_settings_map(conn, &settings)
+                })
+                .await
+                .unwrap();
+            let before = storage.load_app_settings_json().await.unwrap();
+            let draft = McpGlobalPolicy { read_only: true, query_timeout_secs: Some(99), ..Default::default() };
+            let error = storage.save_mcp_global_policy(&draft).await.unwrap_err();
+            assert!(error.starts_with("MCP_POLICY_UNAVAILABLE: invalid MCP access policy:"), "{error}");
+            assert_eq!(storage.load_app_settings_json().await.unwrap(), before);
+            assert!(storage.load_mcp_access_policy().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_v1_saves_preserve_immediate_scopes_but_allow_salesforce_dml_changes() {
+        use crate::mcp_access::{
+            McpAccessLevel, McpAccessRule, McpRuleTarget, McpSubScopeMode, SALESFORCE_WRITE_TOOLSET,
+        };
+        let path = temp_db_path("mcp-scope-draft-merge");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        let mut draft = McpGlobalPolicy { read_only: false, ..Default::default() };
+        let rule: crate::storage::McpConnectionPolicy = serde_json::from_value(serde_json::json!({
+            "connectionId": "nacos", "readOnly": false, "executionModeConfigured": true,
+            "executionModePolicyVersion": 1, "databaseScope": "all"
+        }))
+        .unwrap();
+        draft.connection_policies.push(rule);
+        storage.save_mcp_global_policy(&draft).await.unwrap();
+        storage
+            .set_mcp_plugin_scope_rule(
+                "nacos",
+                "namespace",
+                Some("dev"),
+                Some(McpAccessRule { visible: Some(true), access: Some(McpAccessLevel::Write), ..Default::default() }),
+                Some(McpSubScopeMode::Selected),
+            )
+            .await
+            .unwrap();
+        // Applying an already-open v1 form must not undo the immediate namespace save.
+        draft.query_timeout_secs = Some(42);
+        storage.save_mcp_global_policy(&draft).await.unwrap();
+        let access = storage.load_mcp_access_policy().await.unwrap();
+        assert_eq!(access.sub_scope_mode("nacos"), McpSubScopeMode::Selected);
+        assert!(!access.resolve(&[], "nacos", Some(("namespace", "prod"))).visible);
+        assert_eq!(
+            storage.load_mcp_global_policy().await.unwrap().policy(),
+            access.to_v1(),
+            "v1 readers must retain the saved scope restriction after a stale draft is applied"
+        );
+        // Mode-only rules also survive, even with an existing v1 connection rule.
+        storage.set_mcp_plugin_scope_rule("nacos", "namespace", None, None, Some(McpSubScopeMode::None)).await.unwrap();
+        storage.save_mcp_global_policy(&draft).await.unwrap();
+        assert_eq!(storage.load_mcp_access_policy().await.unwrap().sub_scope_mode("nacos"), McpSubScopeMode::None);
+        assert_eq!(
+            storage.load_mcp_global_policy().await.unwrap().policy(),
+            storage.load_mcp_access_policy().await.unwrap().to_v1()
+        );
+        for allowed in [true, false, true] {
+            draft.connection_policies[0].allow_salesforce_dml = allowed;
+            storage.save_mcp_global_policy(&draft).await.unwrap();
+            let access = storage.load_mcp_access_policy().await.unwrap();
+            assert_eq!(
+                access.toolset_ceiling("nacos", SALESFORCE_WRITE_TOOLSET) == Some(McpAccessLevel::Full),
+                allowed
+            );
+        }
+        // Two independent row saves retain both changes.
+        let (a, b) = tokio::join!(
+            storage.set_mcp_plugin_scope_rule(
+                "a",
+                "namespace",
+                Some("one"),
+                Some(McpAccessRule { visible: Some(true), ..Default::default() }),
+                Some(McpSubScopeMode::Selected)
+            ),
+            storage.set_mcp_plugin_scope_rule(
+                "b",
+                "namespace",
+                Some("two"),
+                Some(McpAccessRule { visible: Some(true), ..Default::default() }),
+                Some(McpSubScopeMode::Selected)
+            )
+        );
+        a.unwrap();
+        b.unwrap();
+        let access = storage.load_mcp_access_policy().await.unwrap();
+        for (id, value) in [("a", "one"), ("b", "two")] {
+            assert!(access.rules.contains_key(&McpRuleTarget::Scope {
+                connection_id: id.into(),
+                scope: "namespace".into(),
+                value: value.into()
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_access_policy_round_trips_and_keeps_v1_in_sync() {
+        use crate::mcp_access::{McpAccessLevel, McpAccessPolicy, McpAccessRule, McpRuleTarget};
+        let path = temp_db_path("mcp-access-policy");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        // Nothing saved: v2 is the mapping of the v1 default.
+        let default = storage.load_mcp_access_policy().await.unwrap();
+        assert_eq!(default, McpAccessPolicy::from_v1(&McpGlobalPolicy::default()));
+
+        // Saving v1 writes the matching v2.
+        let v1 = McpGlobalPolicy { read_only: false, allow_dangerous_sql: true, ..Default::default() };
+        storage.save_mcp_global_policy(&v1).await.unwrap();
+        assert_eq!(storage.load_mcp_access_policy().await.unwrap().default_access, McpAccessLevel::Full);
+
+        // Saving v2 writes the never-wider v1 projection.
+        let mut v2 = McpAccessPolicy { default_access: McpAccessLevel::Write, ..Default::default() };
+        v2.rules.insert(
+            McpRuleTarget::Connection { id: "c".into() },
+            McpAccessRule { access: Some(McpAccessLevel::Read), ..Default::default() },
+        );
+        storage.save_mcp_access_policy(&v2).await.unwrap();
+        assert_eq!(storage.load_mcp_access_policy().await.unwrap(), v2);
+        let projected = storage.load_mcp_global_policy().await.unwrap().policy();
+        assert!(!projected.read_only && !projected.allow_dangerous_sql);
+        assert!(projected.connection_policies.iter().any(|rule| rule.connection_id == "c" && rule.read_only));
+
+        // Whole-map settings writers keep both keys.
+        storage.save_app_settings_json(&serde_json::Map::new()).await.unwrap();
+        assert_eq!(storage.load_mcp_access_policy().await.unwrap(), v2);
+
+        // Hosts enforce the v2 policy even if the v1 key was rewritten by an
+        // older writer with something wider.
+        let mut wider = projected.clone();
+        wider.read_only = false;
+        wider.allow_dangerous_sql = true;
+        wider.connection_policies.clear();
+        storage
+            .with_conn(move |conn| {
+                let mut settings = app_settings_map_from_conn(conn)?;
+                settings.insert(MCP_GLOBAL_POLICY_KEY.to_string(), serde_json::to_value(&wider).unwrap());
+                write_app_settings_map(conn, &settings)
+            })
+            .await
+            .unwrap();
+        let enforced = storage.load_enforced_mcp_policy().await.unwrap().policy();
+        assert!(!enforced.allow_dangerous_sql, "v2 stays authoritative");
+        assert!(enforced.connection_policies.iter().any(|rule| rule.connection_id == "c" && rule.read_only));
+    }
+
+    #[test]
+    fn malformed_plugin_mcp_grants_are_skipped() {
+        let grants = plugin_mcp_grants_from(Some(&serde_json::json!({
+            "io.ok": { "external": true, "ceiling": "read", "approvedTools": {}, "disabledTools": [] },
+            "io.bad": { "external": "yes" },
+            " ": { "external": true, "ceiling": "read" }
+        })));
+        assert_eq!(grants.keys().collect::<Vec<_>>(), ["io.ok"]);
+        assert!(plugin_mcp_grants_from(Some(&serde_json::json!([]))).is_empty());
+    }
+
+    #[tokio::test]
     async fn max_retries_survives_stale_app_settings_save() {
         let path = temp_db_path("max-retries-stale-save");
         let storage = crate::persistence::test_storage::open(&path).await.unwrap();
@@ -12259,6 +15025,7 @@ mod tests {
         storage
             .save_desktop_settings(&DesktopSettings {
                 show_tray_icon: false,
+                linux_floating_frame_enabled: true,
                 icon_theme: DesktopIconTheme::Black,
                 ..DesktopSettings::default()
             })
@@ -12271,6 +15038,7 @@ mod tests {
             storage.load_desktop_settings().await.unwrap(),
             DesktopSettings {
                 show_tray_icon: false,
+                linux_floating_frame_enabled: true,
                 icon_theme: DesktopIconTheme::Black,
                 ..DesktopSettings::default()
             }
@@ -12389,6 +15157,8 @@ mod tests {
             default_mode: Some(AiAssistantMode::Agent),
             default_auto_routing: true,
             restore_last_conversation: true,
+            include_query_result: false,
+            exclude_query_result: false,
             default_templates_by_db_type: BTreeMap::from([("postgresql".to_string(), vec!["tpl-1".to_string()])]),
             last_used_templates_by_db_type: BTreeMap::from([("mysql".to_string(), vec!["tpl-2".to_string()])]),
         };
@@ -12397,6 +15167,70 @@ mod tests {
 
         assert_eq!(storage.load_ai_chat_selection().await.unwrap(), Some(selection));
         assert_eq!(storage.load_app_settings_json().await.unwrap().get("ai_chat_selection_v1"), None);
+    }
+
+    #[tokio::test]
+    async fn type_management_recovery_manifest_survives_sqlite_storage_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dbx.db");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        let key = |name: &str| crate::db::OracleTypeDataRelationKey { owner: "Mixed Owner".into(), name: name.into() };
+        let baseline = |name: &str, row_count, read_only| crate::db::OracleTypeDataBaseline {
+            relation: crate::db::OracleTypeDataRelation {
+                relation: key(name),
+                object_id: "9007199254740993".into(),
+                read_only: Some(read_only),
+                structure: format!("{name}-definition"),
+                projection: vec![crate::db::OracleTypeDataProjection {
+                    path: vec!["ID".into()],
+                    object_null: false,
+                    data_type: "NUMBER(38,0)".into(),
+                }],
+            },
+            row_count,
+            fingerprint: "d".repeat(64),
+        };
+        let manifest = crate::db::OracleTypeDataManifest {
+            mapping: crate::db::OracleTypeDataMappingInput {
+                id: "same-original-baseline".into(),
+                source: key("SRC"),
+                old: key("OLD"),
+                expected: key("EXPECTED"),
+                target: key("RESULT"),
+                fields: vec![crate::db::OracleTypeDataField {
+                    source_path: vec!["ID".into()],
+                    object_null: false,
+                    old_column: "ID".into(),
+                    expected_column: "ID".into(),
+                    target_path: vec!["ID".into()],
+                    target_object_null: false,
+                    unchanged: true,
+                }],
+            },
+            original: baseline("SRC", 3, false),
+            old: baseline("OLD", 3, true),
+            expected: baseline("EXPECTED", 3, true),
+            prepared_target: Some(baseline("RESULT", 0, false)),
+            verified_target: None,
+        };
+        let state = serde_json::json!({
+            "tabs": [{
+                "id": "source-type", "title": "TYPE", "connectionId": "fixture", "database": "APP", "sql": "TYPE draft",
+                "typeManagementDraft": {
+                    "version": 1, "planId": "type-recovery-1", "revision": 9,
+                    "target": {"connectionId": "fixture", "database": "APP", "owner": "Mixed Owner", "name": "Type' Name", "databaseType": "oracle"},
+                    "operation": "save-spec", "requiresReverify": true, "state": "stopped",
+                    "drafts": [{"owner": "Mixed Owner", "name": "Type' Name", "objectType": "TYPE BODY", "source": "TYPE BODY draft"}],
+                    "steps": [{"id": "root", "state": "confirmed"}, {"id": "body", "state": "unknown"}],
+                    "dataMappings": [{"manifest": manifest, "insertSql": "bounded INSERT preview", "insertDraft": "bounded INSERT preview", "insertState": "unknown"}]
+                }
+            }], "activeTabId": "source-type"
+        });
+        storage.save_open_tabs_state(&state).await.unwrap();
+        assert_eq!(storage.load_open_tabs_state().await.unwrap(), Some(state.clone()));
+        drop(storage);
+        let reopened = crate::persistence::test_storage::open(&path).await.unwrap();
+        assert_eq!(reopened.load_open_tabs_state().await.unwrap(), Some(state));
     }
 
     // Selection JSON written before per-db-type prompt template defaults existed
@@ -12569,6 +15403,7 @@ mod tests {
         let path = temp_db_path("saved-sql-summary");
         let storage = crate::persistence::test_storage::open(&path).await.unwrap();
         let file = SavedSqlFile {
+            is_default_query: false,
             id: "sql-1".to_string(),
             connection_id: "conn-1".to_string(),
             folder_id: None,
@@ -12610,6 +15445,7 @@ mod tests {
         let path = temp_db_path("saved-sql-preserve-unloaded-text");
         let storage = crate::persistence::test_storage::open(&path).await.unwrap();
         let mut file = SavedSqlFile {
+            is_default_query: false,
             id: "sql-1".to_string(),
             connection_id: "conn-1".to_string(),
             folder_id: None,
@@ -12678,6 +15514,7 @@ mod tests {
         assert_eq!(legacy.catalog, None);
 
         let external = SavedSqlFile {
+            is_default_query: false,
             id: "external".to_string(),
             connection_id: "conn-1".to_string(),
             catalog: Some("iceberg_catalog".to_string()),
@@ -12741,6 +15578,7 @@ mod tests {
                 pi_agent_cli_env: std::collections::HashMap::new(),
                 opencode_cli_path: None,
                 opencode_cli_env: std::collections::HashMap::new(),
+                opencode_cli_version: None,
                 cursor_cli_path: None,
                 cursor_cli_env: std::collections::HashMap::new(),
                 grok_cli_path: None,
@@ -13836,6 +16674,16 @@ mod tests {
         assert_eq!(super::migration_backup_paths(&valid).unwrap(), vec!["/tmp/dbx-secret-migration-a"]);
     }
 
+    #[test]
+    fn migration_errors_preserve_keyring_failure_classification() {
+        assert_eq!(super::migration_error_code("KEYRING_ACCESS_FAILED: item denied"), "KEYRING_ACCESS_FAILED");
+        assert_eq!(super::migration_error_code("KEYRING_WRITE_FAILED: item denied"), "KEYRING_WRITE_FAILED");
+        assert_eq!(
+            super::migration_safe_message("KEYRING_ACCESS_FAILED", "ignored"),
+            "The platform credential store refused access to the DBX secret-store key"
+        );
+    }
+
     #[tokio::test]
     async fn stored_connection_count_reads_the_table_without_loading_secrets() {
         let dir = tempfile::tempdir().unwrap();
@@ -13862,5 +16710,134 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(storage.stored_connection_count().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn task_run_storage_is_idempotent_paginated_and_deletes_only_terminal_runs() {
+        use crate::persistence::task_history::{
+            RowCountState, TaskEndpointSnapshot, TaskHistoryStorageError, TaskItemKind, TaskItemStatus,
+            TaskLifecycleOwner, TaskRun, TaskRunItem, TaskRunItemsQuery, TaskRunListQuery, TaskRunStatus, TaskType,
+            TransferObjectSelectionMode, TransferRunContent, TransferRunDetails, TransferRunMode,
+            TransferRunOwnershipPolicy, TransferRunTargetTableNameCase,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dbx.db");
+        let storage = crate::persistence::test_storage::open_unmigrated(&path).await.unwrap();
+        let run = TaskRun {
+            run_id: "history-storage-run".to_string(),
+            task_type: TaskType::Transfer,
+            lifecycle_owner: TaskLifecycleOwner::Web,
+            status: TaskRunStatus::Running,
+            created_at: "2025-01-01T00:00:00.000Z".to_string(),
+            started_at: "2025-01-01T00:00:00.000Z".to_string(),
+            finished_at: None,
+            owner_instance_id: "test-instance".to_string(),
+            error_code: None,
+            safe_error_summary: None,
+            history_complete: false,
+            source: TaskEndpointSnapshot {
+                connection_id: "source-id".to_string(),
+                database_type: "sqlite".to_string(),
+                database: "source-db".to_string(),
+                schema: "main".to_string(),
+                catalog: None,
+            },
+            target: TaskEndpointSnapshot {
+                connection_id: "target-id".to_string(),
+                database_type: "sqlite".to_string(),
+                database: "target-db".to_string(),
+                schema: "main".to_string(),
+                catalog: None,
+            },
+        };
+        let details = TransferRunDetails {
+            run_id: run.run_id.clone(),
+            content: TransferRunContent::DataOnly,
+            mode: TransferRunMode::Append,
+            batch_size: 500,
+            create_table: false,
+            drop_target_before_create: false,
+            target_table_name_case: TransferRunTargetTableNameCase::Preserve,
+            quote_target_column_names: true,
+            ownership_policy: TransferRunOwnershipPolicy::Preserve,
+            filtered_table_count: 0,
+            table_total: 1,
+            object_selection_mode: TransferObjectSelectionMode::Explicit,
+            selected_object_count: Some(0),
+        };
+        let item = TaskRunItem {
+            run_id: run.run_id.clone(),
+            item_index: 0,
+            item_kind: TaskItemKind::Table,
+            source_object: "orders".to_string(),
+            target_object: "orders".to_string(),
+            status: TaskItemStatus::Pending,
+            source_row_count: None,
+            moved_row_count: None,
+            target_row_count: None,
+            row_count_state: RowCountState::Unknown,
+            has_table_filter: false,
+            safe_error_summary: None,
+        };
+
+        storage.create_task_run(&run, &details, std::slice::from_ref(&item)).await.unwrap();
+        assert_eq!(
+            storage.create_task_run(&run, &details, std::slice::from_ref(&item)).await,
+            Err(TaskHistoryStorageError::RunIdConflict)
+        );
+        assert_eq!(storage.delete_task_run(&run.run_id).await, Err(TaskHistoryStorageError::RunStillRunning));
+
+        let completed_item = TaskRunItem {
+            status: TaskItemStatus::Succeeded,
+            source_row_count: Some(0),
+            moved_row_count: Some(0),
+            row_count_state: RowCountState::Known,
+            ..item
+        };
+        assert!(storage.save_task_run_item(&completed_item).await.unwrap());
+        assert!(storage.finish_task_run(&run.run_id, TaskRunStatus::Succeeded, None, None, true).await.unwrap());
+        assert!(!storage
+            .finish_task_run(&run.run_id, TaskRunStatus::Failed, Some("late"), Some("late"), true)
+            .await
+            .unwrap());
+
+        let older_run = TaskRun {
+            run_id: "history-storage-run-older".to_string(),
+            created_at: "2024-12-31T00:00:00.000Z".to_string(),
+            started_at: "2024-12-31T00:00:00.000Z".to_string(),
+            ..run.clone()
+        };
+        let older_details = TransferRunDetails { run_id: older_run.run_id.clone(), ..details.clone() };
+        storage.create_task_run(&older_run, &older_details, &[]).await.unwrap();
+        assert!(storage.finish_task_run(&older_run.run_id, TaskRunStatus::Succeeded, None, None, true).await.unwrap());
+
+        let page = storage.list_task_runs(TaskRunListQuery { limit: Some(1), ..Default::default() }).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].run_id, run.run_id);
+        let cursor = page.next_cursor.clone().expect("older run must be available on the next page");
+        let next_page = storage
+            .list_task_runs(TaskRunListQuery { limit: Some(1), cursor: Some(cursor), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(next_page.items.len(), 1);
+        assert_eq!(next_page.items[0].run_id, older_run.run_id);
+        assert!(next_page.next_cursor.is_none());
+        let item_page = storage
+            .list_task_run_items(&run.run_id, TaskRunItemsQuery { limit: Some(1), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(item_page.items[0].source_row_count, Some(0));
+        assert_eq!(item_page.items[0].moved_row_count, Some(0));
+        assert_eq!(item_page.items[0].target_row_count, None);
+
+        drop(storage);
+        let reopened = crate::persistence::test_storage::open_unmigrated(&path).await.unwrap();
+        let detail = reopened.get_task_run_detail(&run.run_id).await.unwrap().unwrap();
+        assert_eq!(detail.run.status, TaskRunStatus::Succeeded);
+        assert!(detail.run.history_complete);
+        assert_eq!(detail.transfer.unwrap().selected_object_count, Some(0));
+        assert!(reopened.delete_task_run(&run.run_id).await.unwrap());
+        assert!(reopened.get_task_run_detail(&run.run_id).await.unwrap().is_none());
     }
 }

@@ -30,11 +30,11 @@ import {
 const props = defineProps<{
   compact?: boolean;
   compactActionCount?: number;
-  navigationVisible?: boolean;
   refresh: DataGridToolbarActionCapability;
   autoRefresh?: DataGridToolbarAutoRefreshCapability;
   addRow?: DataGridToolbarAddRowCapability;
   deleteRow?: DataGridToolbarActionCapability;
+  deleteColumn?: DataGridToolbarActionCapability;
   copyData?: DataGridToolbarCopyCapability;
   exportData?: DataGridToolbarExportCapability;
   transpose?: DataGridToolbarActionCapability;
@@ -62,10 +62,10 @@ const visibleActionOrder = computed<DataGridToolbarActionKey[]>(() => {
   const visibility: Record<DataGridToolbarActionKey, boolean> = {
     refresh: isDataGridToolbarCapabilityVisible(props.refresh),
     autoRefresh: isDataGridToolbarCapabilityVisible(props.autoRefresh),
-    navigation: props.navigationVisible === true,
     copyData: isDataGridToolbarCapabilityVisible(props.copyData),
     addRow: isDataGridToolbarCapabilityVisible(props.addRow),
     deleteRow: isDataGridToolbarCapabilityVisible(props.deleteRow),
+    deleteColumn: isDataGridToolbarCapabilityVisible(props.deleteColumn),
     exportData: isDataGridToolbarCapabilityVisible(props.exportData),
     transpose: isDataGridToolbarCapabilityVisible(props.transpose),
     tableInfo: isDataGridToolbarCapabilityVisible(props.tableInfo),
@@ -133,14 +133,12 @@ function actionLabelClass(action: DataGridToolbarActionKey) {
           {{ autoRefresh?.enabled ? autoRefresh.stopLabel : autoRefresh?.startLabel }}
         </DropdownMenuItem>
         <DropdownMenuItem v-for="seconds in autoRefreshIntervals" :key="seconds" class="gap-2" :disabled="autoRefresh?.disabled" @select="void selectDataGridToolbarAutoRefreshInterval(autoRefresh, seconds)">
-          <Check v-if="autoRefresh?.intervalSeconds === seconds" class="h-3.5 w-3.5" />
+          <Check v-if="autoRefresh?.enabled && autoRefresh.intervalSeconds === seconds" class="h-3.5 w-3.5" />
           <span v-else class="h-3.5 w-3.5" />
           {{ autoRefresh?.intervalLabel(seconds) }}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
-
-    <slot name="navigation" :compact="actionIsCompact('navigation')" />
 
     <div v-if="isDataGridToolbarCapabilityVisible(copyData)" class="flex h-5 shrink-0 items-stretch overflow-hidden rounded-md border border-border">
       <Tooltip>
@@ -201,12 +199,29 @@ function actionLabelClass(action: DataGridToolbarActionKey) {
 
     <Tooltip v-if="isDataGridToolbarCapabilityVisible(deleteRow)">
       <TooltipTrigger as-child>
-        <Button data-toolbar-action="deleteRow" variant="ghost" size="sm" :class="actionButtonClass('deleteRow')" :disabled="isDataGridToolbarCapabilityDisabled(deleteRow)" @click="void triggerDataGridToolbarAction(deleteRow)">
+        <Button data-toolbar-action="deleteRow" variant="ghost" size="sm" :class="[...actionButtonClass('deleteRow'), 'text-destructive hover:bg-destructive/10 hover:text-destructive']" :disabled="isDataGridToolbarCapabilityDisabled(deleteRow)" @click="void triggerDataGridToolbarAction(deleteRow)">
           <Trash2 class="data-grid-topbar-action-icon h-3 w-3" />
           <span class="data-grid-topbar-action-label" :class="actionLabelClass('deleteRow')">{{ deleteRow?.label }}</span>
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom">{{ deleteRow?.tooltip ?? deleteRow?.label }}</TooltipContent>
+    </Tooltip>
+
+    <Tooltip v-if="isDataGridToolbarCapabilityVisible(deleteColumn)">
+      <TooltipTrigger as-child>
+        <Button
+          data-toolbar-action="deleteColumn"
+          variant="ghost"
+          size="sm"
+          :class="[...actionButtonClass('deleteColumn'), 'text-destructive hover:bg-destructive/10 hover:text-destructive']"
+          :disabled="isDataGridToolbarCapabilityDisabled(deleteColumn)"
+          @click="void triggerDataGridToolbarAction(deleteColumn)"
+        >
+          <Trash2 class="data-grid-topbar-action-icon h-3 w-3" />
+          <span class="data-grid-topbar-action-label" :class="actionLabelClass('deleteColumn')">{{ deleteColumn?.label }}</span>
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{{ deleteColumn?.tooltip ?? deleteColumn?.label }}</TooltipContent>
     </Tooltip>
 
     <DropdownMenu v-if="isDataGridToolbarCapabilityVisible(exportData)">
@@ -257,6 +272,7 @@ function actionLabelClass(action: DataGridToolbarActionKey) {
           size="sm"
           :class="[...actionButtonClass('tableInfo'), tableInfo?.active ? 'bg-primary/10 text-primary hover:bg-primary/15' : '']"
           :disabled="isDataGridToolbarCapabilityDisabled(tableInfo)"
+          :aria-label="tableInfo?.tooltip ?? tableInfo?.label"
           :aria-pressed="tableInfo?.active"
           @click="void triggerDataGridToolbarAction(tableInfo)"
         >

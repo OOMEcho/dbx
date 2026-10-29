@@ -9,9 +9,19 @@ const dataGridSource = readFileSync(dataGridPath, "utf8");
 test("set NULL applies a real null value only to editable selections", () => {
   const handler = dataGridSource.match(/function setSelectionNull\(\) \{[^]*?\n\}/)?.[0] ?? "";
 
-  assert.match(handler, /if \(!props\.editable \|\| !selectionHasEditableCells\(\)\) return;/);
+  assert.match(dataGridSource, /const resolvedConnectionConfig = computed\(\(\) => connectionStore\.getConfig\(props\.connectionId \?\? ""\)\);/);
+  assert.match(dataGridSource, /const compatibilityReadOnly = computed\(\(\) => mysqlDataCharsetEnabled\(resolvedConnectionConfig\.value\)\);/);
+  assert.match(dataGridSource, /const effectiveEditable = computed\(\(\) => !!props\.editable && !compatibilityReadOnly\.value\);/);
+  assert.match(handler, /if \(!effectiveEditable\.value \|\| !selectionHasEditableCells\(\)\) return;/);
   assert.match(handler, /fillSelectionWithValue\(null\);/);
   assert.doesNotMatch(handler, /fillSelectionWithValue\(["'](?:NULL)?["']\)/);
+});
+
+test("hide identical columns compares full-width rows, not visibility-projected ones", () => {
+  const fn = dataGridSource.match(/function getComparisonRows\(\)[^{]*\{[^]*?\n\}/)?.[0] ?? "";
+  assert.ok(fn, "getComparisonRows not found");
+  assert.match(fn, /\bdisplayItems\.value/);
+  assert.doesNotMatch(fn, /visibleDisplayItems/);
 });
 
 test("editable cell selections expose generation after bulk edit", () => {

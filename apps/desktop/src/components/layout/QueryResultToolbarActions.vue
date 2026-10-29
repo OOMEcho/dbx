@@ -8,7 +8,7 @@ import * as api from "@/lib/backend/api";
 import { createFrontendPluginRegistry, type PluginContributionEntry } from "@/lib/plugins/frontendPlugin";
 import type { InstalledPlugin, PluginResultViewContribution } from "@/types/database";
 
-type OutputView = "result" | "summary" | "explain" | "chart" | "messages" | "profile";
+type OutputView = "result" | "graph" | "summary" | "explain" | "chart" | "messages" | "profile";
 
 const props = withDefaults(
   defineProps<{
@@ -55,6 +55,7 @@ void refreshInstalledPlugins();
 
 <template>
   <div data-query-result-toolbar-actions class="flex shrink-0 items-center gap-1 border-r px-1">
+    <slot />
     <LightTooltip :text="t('explain.title')" :disabled="!compact" side="bottom" :delay="0" :close-delay="0" nowrap>
       <Button
         size="sm"

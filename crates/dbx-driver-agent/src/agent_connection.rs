@@ -407,14 +407,14 @@ pub fn oracle_alternate_connect_configs(config: &ConnectionConfig, err: &str) ->
     let normalized = err.to_lowercase();
     let candidates = if normalized.contains("ora-12505") {
         vec![service_url, descriptor_service_url, legacy_service_url]
-    } else if normalized.contains("ora-12514") {
-        vec![sid_url, descriptor_sid_url, legacy_service_url]
     } else {
-        match config.oracle_connection_type.as_deref() {
-            Some("sid") => vec![service_url, legacy_service_url, descriptor_sid_url, descriptor_service_url],
-            _ => vec![sid_url, legacy_service_url, descriptor_service_url, descriptor_sid_url],
-        }
+        // ORA-12514: the listener answered but does not know the service name, so a
+        // SID/legacy/descriptor spelling is the only thing that can help.
+        vec![sid_url, descriptor_sid_url, legacy_service_url]
     };
+    // The retries travel through `oracle_jdbc_connection_string` as a stored
+    // connection string, so they must already carry the profile's protocol.
+    let candidates: Vec<String> = candidates.into_iter().map(|url| oracle_url_for_profile(config, url)).collect();
 
     let mut urls = Vec::new();
     for url in candidates {
@@ -434,6 +434,20 @@ pub fn oracle_alternate_connect_configs(config: &ConnectionConfig, err: &str) ->
         .collect()
 }
 
+/// Applies the OCI (thick) protocol to an Oracle JDBC URL when the connection
+/// selects the OCI driver profile. Thin connections keep the URL unchanged.
+///
+/// OCI reaches the same targets as thin; the TNS form additionally moves its
+/// `TNS_ADMIN` query into the agent-process environment
+/// (`crate::oracle_oci::oracle_oci_launch_env`).
+fn oracle_url_for_profile(config: &ConnectionConfig, url: String) -> String {
+    if !crate::oracle_oci::uses_oracle_oci_profile(config) {
+        return url;
+    }
+    let rewritten = crate::oracle_oci::rewrite_oracle_url_protocol(&url, true);
+    crate::oracle_oci::strip_oracle_tns_admin_query(&rewritten)
+}
+
 fn oracle_jdbc_connection_string(
     config: &ConnectionConfig,
     host: &str,
@@ -443,9 +457,12 @@ fn oracle_jdbc_connection_string(
     if let Some(connection_string) = config.connection_string.as_deref().filter(|value| !value.trim().is_empty()) {
         let connection_string = connection_string.trim();
         if host == config.host && port == config.port {
-            return Ok(connection_string.to_string());
+            return Ok(oracle_url_for_profile(config, connection_string.to_string()));
         }
-        return crate::models::connection::rewrite_jdbc_url_host(connection_string, host, port);
+        return Ok(oracle_url_for_profile(
+            config,
+            crate::models::connection::rewrite_jdbc_url_host(connection_string, host, port)?,
+        ));
     }
 
     let database = database.trim();
@@ -453,20 +470,33 @@ fn oracle_jdbc_connection_string(
         return Ok(String::new());
     }
 
-    Ok(if config.oracle_connection_type.as_deref() == Some("sid") {
+    let url = if config.oracle_connection_type.as_deref() == Some("sid") {
         oracle_sid_jdbc_url(host, port, database)
     } else {
         oracle_service_jdbc_url(host, port, database)
-    })
+    };
+    Ok(oracle_url_for_profile(config, url))
 }
 
+/// Whether Oracle's alternate connection descriptors can plausibly fix this error.
+///
+/// The alternates only rewrite how the *connect descriptor* names the service/SID
+/// (`//host:port/service`, `host:port:SID`, `(DESCRIPTION=...)`); they never change
+/// host, port or route. ORA-12505/ORA-12514 are answered by a listener that is
+/// reachable on host:port, so a wrong service/SID spelling is exactly what they
+/// diagnose. ORA-12541 ("no listener"), timeouts and resets mean the listener was
+/// never reached, so retrying three more descriptor spellings only opens three
+/// more TCP connections that cannot succeed.
+///
+/// That matters beyond wasted time: enterprise zero-trust/security clients in
+/// front of the database run an authorization check for every new connection and
+/// pop a native warning per failed check, so one failed connect used to stack up
+/// to five dialogs (1 initial + 4 alternates) per attempt. Keep the failure to one
+/// connection; ORA-12541 keeps the "try Service Name/SID" hint
+/// (`oracle_error_with_driver_hint`), it just no longer auto-retries.
 fn oracle_listener_error_can_retry(err: &str) -> bool {
     let normalized = err.to_lowercase();
-    normalized.contains("ora-12505")
-        || normalized.contains("ora-12514")
-        || normalized.contains("ora-12541")
-        || normalized.contains("no listener")
-        || err.contains("没有监听程序")
+    normalized.contains("ora-12505") || normalized.contains("ora-12514")
 }
 
 fn oracle_service_jdbc_url(host: &str, port: u16, database: &str) -> String {
@@ -758,12 +788,15 @@ fn hive_parameters_use_zookeeper_discovery(source: &str) -> bool {
 mod tests {
     use super::*;
     use crate::models::connection::{
-        default_connect_timeout_secs, default_idle_timeout_secs, default_keepalive_interval_secs,
-        default_query_timeout_secs, default_redis_key_separator,
+        default_connect_timeout_secs, default_idle_disconnect_secs, default_idle_timeout_secs,
+        default_keepalive_interval_secs, default_manual_transaction_timeout_secs, default_query_timeout_secs,
+        default_redis_key_separator,
     };
 
     fn config(db_type: DatabaseType, database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: "conn".to_string(),
             name: "Connection".to_string(),
@@ -784,6 +817,9 @@ mod tests {
             visible_schemas: None,
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
+            show_database_links: None,
+            show_native_jobs: None,
+            show_user_admin: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -791,6 +827,8 @@ mod tests {
             connect_timeout_secs: default_connect_timeout_secs(),
             query_timeout_secs: default_query_timeout_secs(),
             idle_timeout_secs: default_idle_timeout_secs(),
+            manual_transaction_timeout_secs: default_manual_transaction_timeout_secs(),
+            idle_disconnect_secs: default_idle_disconnect_secs(),
             keepalive_interval_secs: default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
@@ -810,6 +848,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -826,6 +865,7 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
         }
     }
@@ -885,6 +925,60 @@ mod tests {
 
             assert_eq!(params["database"], "ORCL");
             assert_eq!(params["connection_string"], expected_url);
+        }
+    }
+
+    #[test]
+    fn oracle_oci_profile_builds_oci8_urls_for_service_and_sid() {
+        for (mode, expected_url) in [
+            ("service_name", "jdbc:oracle:oci8:@//oracle.example.com:1521/ORCLPDB1"),
+            ("sid", "jdbc:oracle:oci8:@oracle.example.com:1521:ORCLPDB1"),
+        ] {
+            let mut cfg = config(DatabaseType::Oracle, Some("ORCLPDB1"));
+            cfg.driver_profile = Some(crate::oracle_oci::ORACLE_OCI_DRIVER_PROFILE.to_string());
+            cfg.oracle_connection_type = Some(mode.to_string());
+
+            let params = agent_connect_params(&cfg, "oracle.example.com", 1521, "ORCLPDB1").unwrap();
+
+            assert_eq!(params["connection_string"], expected_url);
+        }
+    }
+
+    #[test]
+    fn oracle_oci_profile_rewrites_tns_urls_and_strips_the_admin_query() {
+        let mut cfg = config(DatabaseType::Oracle, None);
+        cfg.driver_profile = Some(crate::oracle_oci::ORACLE_OCI_DRIVER_PROFILE.to_string());
+        cfg.connection_string = Some("jdbc:oracle:oci8:@ORCLPDB1?TNS_ADMIN=C%3A%5Coracle%5Cwallets".to_string());
+
+        // 主机与端口沿用连接自身：TNS 别名 URL 不参与主机改写（别名没有 host）。
+        let params = agent_connect_params(&cfg, &cfg.host.clone(), cfg.port, "").unwrap();
+
+        assert_eq!(params["connection_string"], "jdbc:oracle:oci8:@ORCLPDB1");
+    }
+
+    #[test]
+    fn oracle_thin_profile_keeps_the_thin_protocol() {
+        let mut cfg = config(DatabaseType::Oracle, Some("ORCLPDB1"));
+        cfg.oracle_connection_type = Some("service_name".to_string());
+
+        let params = agent_connect_params(&cfg, "oracle.example.com", 1521, "ORCLPDB1").unwrap();
+
+        assert_eq!(params["connection_string"], "jdbc:oracle:thin:@//oracle.example.com:1521/ORCLPDB1");
+    }
+
+    #[test]
+    fn oracle_oci_alternate_connect_configs_stay_on_the_oci_protocol() {
+        let mut cfg = config(DatabaseType::Oracle, Some("ORCLPDB1"));
+        cfg.driver_profile = Some(crate::oracle_oci::ORACLE_OCI_DRIVER_PROFILE.to_string());
+        cfg.oracle_connection_type = Some("service_name".to_string());
+
+        let alternates =
+            oracle_alternate_connect_configs(&cfg, "ORA-12514: listener does not currently know of service");
+
+        assert!(!alternates.is_empty());
+        for alternate in &alternates {
+            let url = alternate.connection_string.as_deref().expect("alternate url");
+            assert!(url.starts_with("jdbc:oracle:oci8:@"), "alternate url must keep the oci8 protocol: {url}");
         }
     }
 
@@ -1326,7 +1420,9 @@ mod tests {
 
         assert_eq!(retry.connection_string.as_deref(), Some("jdbc:oracle:thin:@127.0.0.1:3306:ORCL"));
         assert!(oracle_alternate_connect_config(&retry, "ORA-01017: invalid username/password").is_none());
-        assert!(oracle_alternate_connect_config(&cfg, "ORA-12541: TNS:no listener").is_some());
+        // ORA-12541 is TCP-level: the listener was never reached, so a descriptor
+        // spelling change cannot help and only opens more connections/dialogs.
+        assert!(oracle_alternate_connect_config(&cfg, "ORA-12541: TNS:no listener").is_none());
     }
 
     #[test]
@@ -1340,25 +1436,27 @@ mod tests {
     }
 
     #[test]
-    fn oracle_no_listener_errors_try_common_jdbc_url_variants() {
+    fn oracle_no_listener_errors_do_not_fan_out_into_extra_connections() {
+        // ORA-12541 / "no listener" means host:port was never reached. Rewriting only
+        // the CONNECT_DATA spelling cannot fix reachability, and every alternate is a
+        // brand-new TCP connection — i.e. another authorization popup in front of an
+        // enterprise zero-trust/security client. One failure must stay one connection.
         let mut cfg = config(DatabaseType::Oracle, Some("ORCL"));
         cfg.host = "oracle.example.com".to_string();
         cfg.port = 1521;
         cfg.driver_profile = Some("oracle".to_string());
         cfg.oracle_connection_type = Some("service_name".to_string());
 
-        let retries = oracle_alternate_connect_configs(&cfg, "ORA-12541: TNS:no listener");
-        let urls: Vec<_> = retries.iter().filter_map(|retry| retry.connection_string.as_deref()).collect();
+        assert!(oracle_alternate_connect_configs(&cfg, "ORA-12541: TNS:no listener").is_empty());
+        assert!(oracle_alternate_connect_configs(&cfg, "ORA-12541: TNS:no listener\n没有监听程序").is_empty());
+        assert!(oracle_alternate_connect_config(&cfg, "ORA-12541: TNS:no listener").is_none());
+        // The actionable hint survives, it just no longer auto-retries.
+        assert!(oracle_error_with_driver_hint(&cfg, "ORA-12541: TNS:no listener").contains("Service Name"));
 
-        assert_eq!(
-            urls,
-            vec![
-                "jdbc:oracle:thin:@oracle.example.com:1521:ORCL",
-                "jdbc:oracle:thin:@oracle.example.com:1521/ORCL",
-                "jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=oracle.example.com)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=ORCL)))",
-                "jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=oracle.example.com)(PORT=1521))(CONNECT_DATA=(SID=ORCL)))",
-            ]
-        );
+        // Listener-answered errors keep their single-purpose alternates: those arrive
+        // after a successful TCP handshake, so the descriptor really can be the fix.
+        let listener_answered = oracle_alternate_connect_configs(&cfg, "ORA-12514: no service");
+        assert_eq!(listener_answered.len(), 3);
     }
 
     #[test]

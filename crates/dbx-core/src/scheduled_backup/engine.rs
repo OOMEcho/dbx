@@ -113,14 +113,16 @@ impl BackupService {
         if success {
             let snapshot = self.store.snapshot().await?;
             if let Some(schedule) = snapshot.schedules.iter().find(|s| Some(&s.id) == fallback.schedule_id.as_ref()) {
-                let ids = snapshot
-                    .runs
-                    .iter()
-                    .filter(|r| r.schedule_id.as_ref() == Some(&schedule.id) && r.status == "success")
-                    .skip(schedule.retention_count)
-                    .map(|r| r.id.clone())
-                    .collect();
-                self.delete_runs(ids).await?;
+                if schedule.retention_count > 0 {
+                    let ids = snapshot
+                        .runs
+                        .iter()
+                        .filter(|r| r.schedule_id.as_ref() == Some(&schedule.id) && r.status == "success")
+                        .skip(schedule.retention_count)
+                        .map(|r| r.id.clone())
+                        .collect();
+                    self.delete_runs(ids).await?;
+                }
             }
         }
         Ok(())
@@ -166,13 +168,13 @@ impl BackupService {
             .into_iter()
             .find(|c| c.id == job.config.connection_id)
             .ok_or("Saved backup connection is unavailable")?;
-        if !matches!(connection.db_type, DatabaseType::Mysql | DatabaseType::Postgres) {
+        if !matches!(connection.db_type, DatabaseType::Mysql | DatabaseType::Postgres | DatabaseType::OpenGauss) {
             return Err("This connection does not support consistent scheduled backups".into());
         }
         if !connection.save_password || connection.one_time {
             return Err("Unattended backups require a saved connection and saved credentials".into());
         }
-        let postgres = connection.db_type == DatabaseType::Postgres;
+        let postgres = matches!(connection.db_type, DatabaseType::Postgres | DatabaseType::OpenGauss);
         job.run.connection_name = connection.name.clone();
         state.configs.write().await.insert(connection.id.clone(), connection);
         check_cancel(stop)?;
@@ -233,6 +235,7 @@ impl BackupService {
             }
             // Metadata discovery may be slow; finish it before starting the snapshot idle timeout.
             let mut targets = Vec::new();
+            let mut found_selected_tables = std::collections::HashSet::new();
             for schema_name in &schemas {
                 check_cancel(stop)?;
                 let mut selected_tables = Vec::new();
@@ -250,7 +253,21 @@ impl BackupService {
                         None,
                     )
                     .await?;
+                    let exact_names = job
+                        .config
+                        .selected_tables
+                        .iter()
+                        .filter(|target| target.database == *database && target.schema == *schema_name)
+                        .map(|target| target.table.as_str())
+                        .collect::<std::collections::HashSet<_>>();
                     for table in &tables {
+                        if job.config.table_filter_mode == "selected" {
+                            if exact_names.contains(table.name.as_str()) {
+                                selected_tables.push(table.name.clone());
+                                found_selected_tables.insert((schema_name.as_str(), table.name.clone()));
+                            }
+                            continue;
+                        }
                         let matched = job
                             .config
                             .table_patterns
@@ -264,7 +281,7 @@ impl BackupService {
                             }
                         }
                     }
-                    let included = if job.config.table_filter_mode == "include" {
+                    let included = if matches!(job.config.table_filter_mode.as_str(), "include" | "selected") {
                         selected_tables.len()
                     } else {
                         tables.len() - excluded_tables.len()
@@ -275,6 +292,21 @@ impl BackupService {
                     }
                 }
                 targets.push((schema_name.clone(), selected_tables, excluded_tables));
+            }
+            if job.config.table_filter_mode == "selected" {
+                let missing = job
+                    .config
+                    .selected_tables
+                    .iter()
+                    .filter(|target| {
+                        target.database == *database
+                            && !found_selected_tables.contains(&(target.schema.as_str(), target.table.clone()))
+                    })
+                    .map(|target| format!("{}.{}.{}", target.database, target.schema, target.table))
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    return Err(format!("Selected backup tables are unavailable: {}", missing.join(", ")));
+                }
             }
             if targets.is_empty() {
                 continue;
@@ -298,7 +330,11 @@ impl BackupService {
                         &job.time_zone,
                         false,
                     )?;
-                    let extension = if job.config.output_compression == "gzip" { "sql.gz" } else { "sql" };
+                    let extension = match job.config.output_compression.as_str() {
+                        "gzip" => "sql.gz",
+                        "nb3" => "nb3",
+                        _ => "sql",
+                    };
                     let path = output.join(format!("{name}.{extension}"));
                     check_output_ancestors(&path, Path::new(&job.config.destination_directory))?;
                     if path.try_exists().map_err(|e| e.to_string())? {
@@ -331,14 +367,16 @@ impl BackupService {
                         include_create_database: false,
                         drop_table_if_exists: job.config.drop_table_if_exists,
                         omit_auto_increment: false,
+                        preserve_original_language: false,
                         fail_on_error: true,
                         prevent_overwrite: true,
-                        output_compression: if job.config.output_compression == "gzip" {
-                            DatabaseExportOutputCompression::Gzip
-                        } else {
-                            DatabaseExportOutputCompression::None
+                        output_compression: match job.config.output_compression.as_str() {
+                            "gzip" => DatabaseExportOutputCompression::Gzip,
+                            "nb3" => DatabaseExportOutputCompression::Nb3,
+                            _ => DatabaseExportOutputCompression::None,
                         },
                         insert_dialect: Default::default(),
+                        insert_mode: Default::default(),
                         snapshot_session_id: Some(snapshot.session_id.clone()),
                         batch_size: 1000,
                         split_max_mb: None,
@@ -409,7 +447,7 @@ fn check_cancel(stop: &CancellationToken) -> Result<(), String> {
     }
 }
 
-fn system_database(name: &str, postgres: bool) -> bool {
+pub(crate) fn system_database(name: &str, postgres: bool) -> bool {
     let name = name.to_ascii_lowercase();
     if postgres {
         matches!(name.as_str(), "template0" | "template1")
